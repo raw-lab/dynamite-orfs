@@ -17,7 +17,7 @@ use crate::dedup::resolve_overlaps;
 use crate::gencode::GeneticCode;
 use crate::gene::{Engine, Gene};
 use crate::markov::MarkovModel;
-use crate::orf::find_orfs;
+use crate::orf::find_gene_orfs;
 use crate::seq::Seq;
 
 const MIN_ORF: usize = 150; // eukaryotic single-exon CDS bar (50 codons)
@@ -33,26 +33,34 @@ pub fn call(contigs: &[(String, Seq)], fixed: Option<u32>, closed: bool) -> (Vec
     };
 
     // Enumerate ATG-initiated ORFs (start required); keep edge ORFs only if open.
+    // Training ORFs stay paired with the contig they were found on.
     let mut per_contig = Vec::with_capacity(contigs.len());
-    let mut training = Vec::new();
+    let mut training: Vec<Vec<(usize, usize, i8)>> = Vec::with_capacity(contigs.len());
     for (_, s) in contigs {
-        let cands = find_orfs(s, &code, MIN_ORF, true, !closed);
-        for c in &cands {
-            if c.end - c.begin + 1 >= TRAIN_MIN && !c.partial_left && !c.partial_right {
-                training.push((c.begin, c.end, c.strand));
-            }
-        }
+        let cands = find_gene_orfs(s, &code, MIN_ORF, true, !closed);
+        training.push(
+            cands
+                .iter()
+                .filter(|c| c.end - c.begin + 1 >= TRAIN_MIN && !c.partial_left && !c.partial_right)
+                .map(|c| (c.begin, c.end, c.strand))
+                .collect(),
+        );
         per_contig.push(cands);
     }
-    let model = if contigs.len() == 1 {
-        MarkovModel::train(&contigs[0].1, &training)
-    } else {
-        MarkovModel::train(&contigs[0].1, &training)
-    };
+    // One model pooled over every contig (it used to train on contig 0 with
+    // the coordinates of *all* contigs: a wrong model, and an index-out-of-
+    // bounds abort whenever a later contig was longer than the first).
+    let sets: Vec<crate::markov::TrainingSet<'_>> = contigs
+        .iter()
+        .zip(&training)
+        .map(|((_, s), t)| (s, t.as_slice()))
+        .collect();
+    let model = MarkovModel::train_pooled(&sets);
 
     let mut genes = Vec::new();
     for ((name, s), cands) in contigs.iter().zip(&per_contig) {
         let mut id = 0usize;
+        let mut local = Vec::new();
         for c in cands {
             let mut llr = model.llr(s, c.begin, c.end, c.strand);
             // Kozak preference: small bonus for ATG with a strong context.
@@ -89,8 +97,9 @@ pub fn call(contigs: &[(String, Seq)], fixed: Option<u32>, closed: bool) -> (Vec
             };
             g.fill_sequences(s, &code);
             g.gc = gc_of(&g.nt);
-            genes.push(g);
+            local.push(g);
         }
+        genes.extend(crate::finalize::finalize_genes(local, s, &code, closed, crate::finalize::SeqSource::Genome, crate::finalize::StartRule::Table));
     }
     (resolve_overlaps(genes, MAX_OVERLAP), tt)
 }
@@ -126,12 +135,17 @@ fn kozak_bonus(seq: &Seq, begin: usize, end: usize, strand: i8) -> f64 {
 }
 
 fn gc_of(nt: &str) -> f64 {
-    if nt.is_empty() {
+    // GC over unambiguous bases only (N is neither GC nor AT).
+    let acgt = nt
+        .bytes()
+        .filter(|b| matches!(b, b'a' | b'A' | b'c' | b'C' | b'g' | b'G' | b't' | b'T'))
+        .count();
+    if acgt == 0 {
         return 0.0;
     }
     let gc = nt
         .bytes()
         .filter(|b| matches!(b, b'g' | b'G' | b'c' | b'C'))
         .count();
-    gc as f64 / nt.len() as f64
+    gc as f64 / acgt as f64
 }

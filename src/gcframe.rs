@@ -15,11 +15,27 @@ use crate::seq::is_gc;
 
 const WINDOW: usize = 120;
 
+/// Value of [`most_gc_frame_prodigal`] for the trailing 1–2 bases that do not
+/// form a full codon triple. Prodigal leaves these at `-1`; callers that need
+/// Prodigal's exact arithmetic must treat this sentinel as `-1`.
+pub const GC_FRAME_UNSET: u8 = u8::MAX;
+
 /// Prodigal's GC frame plot: `out[i] ∈ {0,1,2}` is the codon frame with the
-/// highest GC content in a window centred on base `i`.
+/// highest GC content in a window centred on base `i`. The last `len % 3`
+/// bases (no full triple) are reported as `0`; see [`most_gc_frame_prodigal`]
+/// for Prodigal's exact `-1` sentinel.
 pub fn most_gc_frame(seq: &[u8]) -> Vec<u8> {
+    most_gc_frame_prodigal(seq)
+        .into_iter()
+        .map(|v| if v == GC_FRAME_UNSET { 0 } else { v })
+        .collect()
+}
+
+/// [`most_gc_frame`] with Prodigal's `-1` for the trailing bases, encoded as
+/// [`GC_FRAME_UNSET`] (Prodigal's reverse-strand GC-bias pass reads them).
+pub fn most_gc_frame_prodigal(seq: &[u8]) -> Vec<u8> {
     let slen = seq.len();
-    let mut gp = vec![0u8; slen.max(1)];
+    let mut gp = vec![GC_FRAME_UNSET; slen.max(1)];
     if slen == 0 {
         return gp;
     }

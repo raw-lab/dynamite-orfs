@@ -304,9 +304,16 @@ pub fn predict(
     dna_ascii: &[u8],
     code: &GeneticCode,
     min_orf_len: i64,
-    _closed: bool,
+    closed: bool,
 ) -> (Vec<Gene>, f64) {
-    let dna: Vec<u8> = dna_ascii.iter().map(|b| b.to_ascii_lowercase()).collect();
+    // (U is read as T, as by every other engine.)
+    let dna: Vec<u8> = dna_ascii
+        .iter()
+        .map(|b| match b.to_ascii_lowercase() {
+            b'u' => b't',
+            c => c,
+        })
+        .collect();
     let n = dna.len() as i64;
     if n < 3 {
         return (Vec::new(), 0.0);
@@ -396,7 +403,10 @@ pub fn predict(
     }
 
     // ----------------------------------------------------------------------
-    // Pass 2: enumerate ORFs (faithful to get_orfs)
+    // Pass 2: enumerate ORFs (faithful to get_orfs), one assembly-gap-free
+    // segment at a time so that no ORF crosses a run of N. Coordinates stay
+    // genome-wide (1-based); statistics and the graph remain whole-genome, as
+    // in the reference. A contig without gaps is a single segment.
     // ----------------------------------------------------------------------
     let mut orfs = OrfStore::new(min_orf_len);
 
@@ -405,29 +415,8 @@ pub fn predict(
         let i = (p - 1) as usize; // 0-based first base
         [dna[i], dna[i + 1], dna[i + 2]]
     };
-
-    // starts[frame] for frames keyed -3..=-1, 1..=3
-    let mut starts: HashMap<i32, Vec<i64>> = HashMap::new();
-    let mut stops: HashMap<i32, i64> = HashMap::new();
-    for f in [1, 2, 3] {
-        starts.insert(f, Vec::new());
-        starts.insert(-f, Vec::new());
-        stops.insert(f, 0);
-    }
-    stops.insert(-1, 1);
-    stops.insert(-2, 2);
-    stops.insert(-3, 3);
-
-    // edge starts at the very beginning (partial 5' ORFs)
-    if !is_start(&dna[0..3.min(dna.len())]) {
-        starts.get_mut(&1).unwrap().push(1);
-    }
-    if dna.len() >= 4 && !is_start(&dna[1..4]) {
-        starts.get_mut(&2).unwrap().push(2);
-    }
-    if dna.len() >= 5 && !is_start(&dna[2..5]) {
-        starts.get_mut(&3).unwrap().push(3);
-    }
+    // genome-wide reading frame (1..=3) of a 1-based position
+    let frame_of = |p: i64| -> i32 { ((p - 1) % 3 + 1) as i32 };
 
     let rbs_fwd = |start: i64| -> usize {
         let lo = (start - 21).max(0) as usize;
@@ -446,90 +435,138 @@ pub fn predict(
         phanotate_score_rbs(&rev_comp(&dna[lo..hi]))
     };
 
-    // main scan: i = 1 .. n-2 inclusive  (range(1, len-1))
-    let frame_cycle = [1i32, 2, 3];
-    let mut fc = 0usize;
-    let mut i = 1i64;
-    while i <= n - 2 {
-        let cod = codon(i);
-        let frame = frame_cycle[fc];
-        fc = (fc + 1) % 3;
-        let rc = [rc_base(cod[2]), rc_base(cod[1]), rc_base(cod[0])];
+    let segments = crate::finalize::segments(dna_ascii);
+    for &(off, seg_len) in &segments {
+        if seg_len < 3 {
+            continue;
+        }
+        let seg_lo = off as i64 + 1; // 1-based first base of the segment
+        let seg_hi = (off + seg_len) as i64; // 1-based last base
 
-        if is_start(&cod) {
-            starts.get_mut(&frame).unwrap().push(i);
-        } else if is_start(&rc) {
-            starts.get_mut(&(-frame)).unwrap().push(i + 2);
-        } else if is_stop(&cod) {
-            let stop = i + 2;
-            let pend: Vec<i64> = starts.get(&frame).unwrap().iter().rev().cloned().collect();
+        // starts[frame] for frames keyed -3..=-1, 1..=3
+        let mut starts: HashMap<i32, Vec<i64>> = HashMap::new();
+        let mut stops: HashMap<i32, i64> = HashMap::new();
+        // Whether the left boundary held in `stops[-f]` is a real stop codon
+        // (it starts out as the segment edge). With --closed, minus-strand
+        // ORFs that would run off the left edge are not created.
+        let mut rev_stop_real: HashMap<i32, bool> = HashMap::new();
+        for f in [1, 2, 3] {
+            starts.insert(f, Vec::new());
+            starts.insert(-f, Vec::new());
+            stops.insert(f, 0);
+            rev_stop_real.insert(-f, false);
+        }
+        // left boundary of each minus frame = first segment position in it
+        for k in 0..3i64 {
+            stops.insert(-frame_of(seg_lo + k), seg_lo + k);
+        }
+
+        // edge starts at the segment's first codons (partial 5' ORFs) — not
+        // with --closed
+        for k in 0..3i64 {
+            let p = seg_lo + k;
+            if !closed && p + 2 <= seg_hi && !is_start(&codon(p)) {
+                starts.get_mut(&frame_of(p)).unwrap().push(p);
+            }
+        }
+
+        // main scan over every full codon of the segment
+        let mut i = seg_lo;
+        while i <= seg_hi - 2 {
+            let cod = codon(i);
+            let frame = frame_of(i);
+            let rc = [rc_base(cod[2]), rc_base(cod[1]), rc_base(cod[0])];
+
+            if is_start(&cod) {
+                starts.get_mut(&frame).unwrap().push(i);
+            } else if is_start(&rc) {
+                starts.get_mut(&(-frame)).unwrap().push(i + 2);
+            } else if is_stop(&cod) {
+                let stop = i + 2;
+                let pend: Vec<i64> = starts.get(&frame).unwrap().iter().rev().cloned().collect();
+                for s in pend {
+                    let length = stop - s + 1;
+                    if length >= orfs.min_orf_len {
+                        let seq = dna[(s - 1) as usize..stop as usize].to_vec();
+                        let rs = rbs_fwd(s);
+                        orfs.add_orf(s, stop - 2, frame, seq, rs);
+                        training_rbs[rs] += 1.0;
+                    }
+                }
+                starts.get_mut(&frame).unwrap().clear();
+                stops.insert(frame, stop);
+            } else if is_stop(&rc) {
+                let stop = *stops.get(&(-frame)).unwrap();
+                let left_ok = !closed || rev_stop_real[&(-frame)];
+                let pend: Vec<i64> = if left_ok { starts.get(&(-frame)).unwrap().clone() } else { Vec::new() };
+                for s in pend {
+                    let length = s - stop + 1;
+                    if length >= orfs.min_orf_len {
+                        let lo = (stop - 1).max(0) as usize;
+                        let seq = rev_comp(&dna[lo..s as usize]);
+                        let rs = rbs_rev(s);
+                        orfs.add_orf(s - 2, stop, -frame, seq, rs);
+                        training_rbs[rs] += 1.0;
+                    }
+                }
+                starts.get_mut(&(-frame)).unwrap().clear();
+                stops.insert(-frame, i);
+                rev_stop_real.insert(-frame, true);
+            }
+            i += 1;
+        }
+
+        // fragment ORFs at the end of the segment
+        for frame in [1i32, 2, 3] {
+            // end of the last full codon of this frame inside the segment
+            let mut end_stop = seg_hi;
+            while end_stop - 2 >= seg_lo && frame_of(end_stop - 2) != frame {
+                end_stop -= 1;
+            }
+            if end_stop - 2 < seg_lo {
+                continue;
+            }
+            // (3'-partial forward fragments are not created with --closed)
+            let pend: Vec<i64> = if closed {
+                Vec::new()
+            } else {
+                starts.get(&frame).unwrap().iter().rev().cloned().collect()
+            };
             for s in pend {
-                let length = stop - s + 1;
-                if length >= orfs.min_orf_len {
-                    let seq = dna[(s - 1) as usize..stop as usize].to_vec();
-                    let rs = rbs_fwd(s);
-                    orfs.add_orf(s, stop - 2, frame, seq, rs);
-                    training_rbs[rs] += 1.0;
+                let length = end_stop - s + 1;
+                if length >= orfs.min_orf_len && end_stop >= s {
+                    let lo = (s - 1).max(0) as usize;
+                    let hi = (end_stop as usize).min(dna.len());
+                    if lo < hi {
+                        let seq = dna[lo..hi].to_vec();
+                        let rs = rbs_fwd(s);
+                        orfs.add_orf(s, end_stop - 2, frame, seq, rs);
+                        training_rbs[rs] += 1.0;
+                    }
                 }
             }
-            starts.get_mut(&frame).unwrap().clear();
-            stops.insert(frame, stop);
-        } else if is_stop(&rc) {
-            let stop = *stops.get(&(-frame)).unwrap();
-            let pend: Vec<i64> = starts.get(&(-frame)).unwrap().clone();
+            // possible partial 3' minus ORF
+            let s_edge = end_stop;
+            let lo3 = (s_edge - 3).max(0) as usize;
+            let hi3 = (s_edge as usize).min(dna.len());
+            let edge_codon = if lo3 < hi3 { dna[lo3..hi3].to_vec() } else { Vec::new() };
+            if !closed && !is_start(&rev_comp(&edge_codon)) {
+                starts.get_mut(&(-frame)).unwrap().push(end_stop);
+            }
+            let left_ok = !closed || rev_stop_real[&(-frame)];
+            let pend: Vec<i64> = if left_ok { starts.get(&(-frame)).unwrap().clone() } else { Vec::new() };
             for s in pend {
+                let stop = *stops.get(&(-frame)).unwrap();
                 let length = s - stop + 1;
-                if length >= orfs.min_orf_len {
+                if length >= orfs.min_orf_len && s >= stop {
                     let lo = (stop - 1).max(0) as usize;
-                    let seq = rev_comp(&dna[lo..s as usize]);
-                    let rs = rbs_rev(s);
-                    orfs.add_orf(s - 2, stop, -frame, seq, rs);
-                    training_rbs[rs] += 1.0;
-                }
-            }
-            starts.get_mut(&(-frame)).unwrap().clear();
-            stops.insert(-frame, i);
-        }
-        i += 1;
-    }
-
-    // fragment ORFs at the end of the genome
-    for frame in [1i32, 2, 3] {
-        let end_stop = n - ((n - (frame as i64 - 1)).rem_euclid(3));
-        let pend: Vec<i64> = starts.get(&frame).unwrap().iter().rev().cloned().collect();
-        for s in pend {
-            let length = end_stop - s + 1;
-            if length >= orfs.min_orf_len && end_stop >= s {
-                let lo = (s - 1).max(0) as usize;
-                let hi = (end_stop as usize).min(dna.len());
-                if lo < hi {
-                    let seq = dna[lo..hi].to_vec();
-                    let rs = rbs_fwd(s);
-                    orfs.add_orf(s, end_stop - 2, frame, seq, rs);
-                    training_rbs[rs] += 1.0;
-                }
-            }
-        }
-        // possible partial 3' minus ORF
-        let s_edge = end_stop;
-        let lo3 = (s_edge - 3).max(0) as usize;
-        let hi3 = (s_edge as usize).min(dna.len());
-        let edge_codon = if lo3 < hi3 { dna[lo3..hi3].to_vec() } else { Vec::new() };
-        if !is_start(&rev_comp(&edge_codon)) {
-            starts.get_mut(&(-frame)).unwrap().push(end_stop);
-        }
-        let pend: Vec<i64> = starts.get(&(-frame)).unwrap().clone();
-        for s in pend {
-            let stop = *stops.get(&(-frame)).unwrap();
-            let length = s - stop + 1;
-            if length >= orfs.min_orf_len && s >= stop {
-                let lo = (stop - 1).max(0) as usize;
-                let hi = (s as usize).min(dna.len());
-                if lo < hi {
-                    let seq = rev_comp(&dna[lo..hi]);
-                    let rs = rbs_rev(s);
-                    orfs.add_orf(s - 2, stop, -frame, seq, rs);
-                    training_rbs[rs] += 1.0;
+                    let hi = (s as usize).min(dna.len());
+                    if lo < hi {
+                        let seq = rev_comp(&dna[lo..hi]);
+                        let rs = rbs_rev(s);
+                        orfs.add_orf(s - 2, stop, -frame, seq, rs);
+                        training_rbs[rs] += 1.0;
+                    }
                 }
             }
         }
@@ -817,32 +854,54 @@ pub fn predict(
         }
     }
 
-    // Source / target
+    // Source / target. The reference links them to ORF ends within 2 kb of the
+    // contig ends. Those distances are measured from the outermost gap-free
+    // segments that hold an ORF — identical for a contig without terminal
+    // gaps, while a leading / trailing assembly gap (no ORF can reach into it)
+    // no longer leaves the path without an entry or exit, which returned no
+    // genes at all. Should no ORF end lie within the window, the window is
+    // anchored on the outermost ORF end instead.
     let source = PNode { typ: NType::Source, frame: 0, position: 0 };
     let target = PNode { typ: NType::Target, frame: 0, position: n + 1 };
     let src_idx = g.node(source);
     let tgt_idx = g.node(target);
     {
         let snapshot: Vec<PNode> = g.nodes.clone();
+        let left_end = |nd: &PNode| (nd.typ == NType::Start && nd.frame > 0) || (nd.typ == NType::Stop && nd.frame < 0);
+        let right_end = |nd: &PNode| (nd.typ == NType::Start && nd.frame < 0) || (nd.typ == NType::Stop && nd.frame > 0);
+        // (0-based offset, 1-based last base) of the segment holding position p
+        let seg_bounds = |p: i64| -> (i64, i64) {
+            let k = segments.partition_point(|&(o, _)| (o as i64) < p).saturating_sub(1);
+            match segments.get(k) {
+                Some(&(o, l)) => (o as i64, (o + l) as i64),
+                None => (0, n),
+            }
+        };
+        let (lo_ref, lo_win) = match snapshot.iter().filter(|nd| left_end(nd)).map(|nd| nd.position).min() {
+            Some(p) => {
+                let lo = seg_bounds(p).0;
+                (lo, if p - lo <= 2000 { lo + 2000 } else { p + 2000 })
+            }
+            None => (0, 2000),
+        };
+        let (hi_ref, hi_win) = match snapshot.iter().filter(|nd| right_end(nd)).map(|nd| nd.position).max() {
+            Some(p) => {
+                let hi = seg_bounds(p).1;
+                (hi, if hi - p <= 2000 { hi - 2000 } else { p - 2000 })
+            }
+            None => (n, n - 2000),
+        };
         for node in &snapshot {
             if node.typ == NType::Source || node.typ == NType::Target {
                 continue;
             }
-            if node.position <= 2000 {
-                if (node.typ == NType::Start && node.frame > 0)
-                    || (node.typ == NType::Stop && node.frame < 0)
-                {
-                    let s = score_gap(node.position, false, pgap);
-                    g.add_edge(source, *node, s);
-                }
+            if node.position <= lo_win && left_end(node) {
+                let s = score_gap(node.position - lo_ref, false, pgap);
+                g.add_edge(source, *node, s);
             }
-            if n - node.position <= 2000 {
-                if (node.typ == NType::Start && node.frame < 0)
-                    || (node.typ == NType::Stop && node.frame > 0)
-                {
-                    let s = score_gap(n - node.position, false, pgap);
-                    g.add_edge(*node, target, s);
-                }
+            if node.position >= hi_win && right_end(node) {
+                let s = score_gap(hi_ref - node.position, false, pgap);
+                g.add_edge(*node, target, s);
             }
         }
     }
@@ -1023,6 +1082,44 @@ pub fn predict(
         genes.push(gene);
     }
 
+    // Shared finalisation, per gap-free segment (whose ends are open edges):
+    // gap-codon trimming, codon-based partial inference (Prodigal's genomic
+    // partial=XY), Edge start type, X for ambiguous codons. PHANOTATE opens
+    // genes at ATG/GTG/TTG under every table.
+    let mut by_seg: Vec<Vec<Gene>> = vec![Vec::new(); segments.len()];
+    for g in genes {
+        let k = segments.partition_point(|&(o, _)| o < g.begin).saturating_sub(1);
+        by_seg[k].push(g);
+    }
+    let mut genes: Vec<Gene> = Vec::new();
+    for (k, mut local) in by_seg.into_iter().enumerate() {
+        if local.is_empty() {
+            continue;
+        }
+        let (off, len) = segments[k];
+        let seg_seq = if off == 0 && len == dna_ascii.len() {
+            encoded.clone()
+        } else {
+            Seq::from_ascii(&dna_ascii[off..off + len])
+        };
+        for g in local.iter_mut() {
+            g.begin -= off;
+            g.end -= off;
+        }
+        let mut done = crate::finalize::finalize_genes(
+            local,
+            &seg_seq,
+            code,
+            closed,
+            crate::finalize::SeqSource::Genome,
+            crate::finalize::StartRule::Bacterial,
+        );
+        crate::finalize::shift_genes(&mut done, off, contig_id);
+        genes.extend(done);
+    }
+    for g in genes.iter_mut() {
+        g.gc = gc_of(&dna, g.begin, g.end);
+    }
     genes.sort_by_key(|g| (g.begin, g.end));
     for (j, gene) in genes.iter_mut().enumerate() {
         gene.id = j + 1;

@@ -22,8 +22,8 @@ use dynamite::fasta::{self, Record};
 use dynamite::gencode::GeneticCode;
 use dynamite::gene::Format;
 use dynamite::model::{CodeChoice, EngineKind, Mode};
-use dynamite::annotate::{annotate, AnnotateConfig};
-use dynamite::{codon, doctor, rna, run_records, sixframe, RunConfig};
+use dynamite::annotate::{annotate_with, AnnotateConfig};
+use dynamite::{codon, doctor, rna, run_records, run_records_with, sixframe, GapMode, RunConfig, RunOptions};
 
 const BANNER: &str = concat!(
     r#"                                                      _.-^^~~~~~^^-._
@@ -57,8 +57,9 @@ ENGINE MODULES  (pure-Rust re-writes — DYNAMITE never shells out to an externa
   genemark       genemark.rs           GeneMark-style 3-periodic Markov caller
   augustus       augustus.rs           AUGUSTUS-style single-exon eukaryote caller
   fraggenescan   fgs/  (vendored)      FragGeneScanRs (Van der Jeugt 2022) — the REAL
-                                       FragGeneScan HMM (Viterbi, frameshift-aware),
-                                       100% identical output; short & long reads
+                                       FragGeneScan HMM (Viterbi) with its `complete`
+                                       model (no sequencing-error frameshift
+                                       correction); short & long reads
   (six-frame)    sixframe.rs           6-frame translation / ORF finder — see
                                        `dynamite translate [--orfs]`
 
@@ -66,7 +67,16 @@ MODE -> ENGINE
   bacteria,archaea            -> prodigal        phage                    -> phanotate
   virus,giant-virus,crassphage-> prodigalgv      meta,auto                -> prodigal-meta
   eukaryote                   -> augustus        reads (short)            -> fraggenescan
-  long-reads (nanopore|pacbio|ont|hifi)          -> fraggenescan (frameshift-aware decode)
+  long-reads (nanopore|pacbio|ont|hifi)          -> fraggenescan (same decode as reads)
+
+GAPS (runs of N)  prodigal, prodigalgv, prodigal-meta — Prodigal's -e / -m
+  --gap-mode 0   default: runs of >= 10 N are gaps; partial genes run into them
+                 as into a contig end (as if the contig were cut there)
+  --gap-mode 1   genes cannot run into gaps (each gene next to a gap is complete)
+  --gap-mode 2   N's are not gaps: genes may span them (Prodigal 2.x default)
+  -m, --mask     Prodigal 2.x -m: no gene is built across or into >= 50 N
+  Prodigal's own spelling works too: -e 0|1|2 (e.g. -e prodigal -e 1).
+  The other engines always use gap mode 0.
 
 INPUT   nucleotide FASTA — contigs, short reads, or long reads (plain or .gz)
 OUTPUT  -f  gff3 | gtf | genbank | faa | fna (alias: ffn) | tsv";
@@ -142,19 +152,31 @@ struct CallArgs {
     #[arg(short = 'p', long = "mode", default_value = "auto")]
     mode: String,
     /// Engine override (a module from the list below): phanotate | prodigal |
-    /// prodigalgv | prodigal-meta | genemark | augustus | fraggenescan.
-    #[arg(short = 'e', long = "engine", value_name = "ENGINE")]
-    engine: Option<String>,
+    /// prodigalgv | prodigal-meta | genemark | augustus | fraggenescan. A
+    /// number instead sets the gap mode, as Prodigal's own -e does (-e 0|1|2,
+    /// see --gap-mode); give -e twice for both, e.g. -e prodigal -e 1.
+    #[arg(short = 'e', long = "engine", value_name = "ENGINE|0|1|2")]
+    engine: Vec<String>,
     /// Genetic code: an NCBI table number (e.g. 11, 4, 15, 25) or "auto".
     #[arg(short = 'g', long = "code", value_name = "CODE|auto")]
     code: Option<String>,
+    /// Gap handling for runs of >= 10 N (prodigal, prodigalgv, prodigal-meta):
+    /// 0 = partial genes run into gaps (default); 1 = genes cannot run into
+    /// gaps; 2 = N's are not gaps (Prodigal 2.x without -m).
+    #[arg(long = "gap-mode", value_name = "0|1|2")]
+    gap_mode: Option<String>,
+    /// Prodigal 2.x -m: treat runs of >= 50 N as masked sequence; no gene is
+    /// built across or into them (prodigal, prodigalgv, prodigal-meta).
+    #[arg(short = 'm', long = "mask", default_value_t = false)]
+    mask: bool,
     /// Minimum ORF length in nucleotides (PHANOTATE engine; default 90).
     #[arg(short = 'l', long = "minlen", default_value_t = 0)]
     minlen: i64,
     /// Do not allow genes to run off the ends of a contig.
     #[arg(long = "closed", default_value_t = false)]
     closed: bool,
-    /// Treat the genome as circular (ends may wrap; currently the default).
+    /// Accepted for compatibility only: genes are never wrapped across the
+    /// origin. Contig ends are open (partial genes allowed) unless --closed.
     #[arg(long = "circular", default_value_t = false)]
     circular: bool,
     /// Worker threads (0 = all available cores).
@@ -188,12 +210,18 @@ struct AllArgs {
     /// Organism mode: phage | virus | giant-virus | crassphage | bacteria | archaea | meta | eukaryote | reads | long-reads | auto.
     #[arg(short = 'p', long = "mode", value_name = "MODE", default_value = "auto")]
     mode: String,
-    /// Force a specific engine: phanotate | prodigal | prodigalgv | prodigal-meta | genemark | augustus | fraggenescan (default: from --mode).
-    #[arg(short = 'e', long = "engine", value_name = "ENGINE")]
-    engine: Option<String>,
+    /// Force a specific engine: phanotate | prodigal | prodigalgv | prodigal-meta | genemark | augustus | fraggenescan (default: from --mode). A number instead sets the gap mode, as Prodigal's own -e does (-e 0|1|2; e.g. -e prodigal -e 1).
+    #[arg(short = 'e', long = "engine", value_name = "ENGINE|0|1|2")]
+    engine: Vec<String>,
     /// Genetic code: an NCBI translation-table number (e.g. 11) or "auto" to detect.
     #[arg(short = 'g', long = "code", value_name = "CODE|auto")]
     code: Option<String>,
+    /// Gap handling for runs of >= 10 N (prodigal engines): 0 = partial genes run into gaps (default); 1 = genes cannot run into gaps; 2 = N's are not gaps.
+    #[arg(long = "gap-mode", value_name = "0|1|2")]
+    gap_mode: Option<String>,
+    /// Prodigal 2.x -m: no gene is built across or into a run of >= 50 N (prodigal engines).
+    #[arg(short = 'm', long = "mask", default_value_t = false)]
+    mask: bool,
     /// Require complete genes only (do not allow genes to run off contig ends).
     #[arg(long = "closed", default_value_t = false)]
     closed: bool,
@@ -232,12 +260,21 @@ struct AnnotateArgs {
     /// Organism mode (see `dynamite call --help`).
     #[arg(short = 'p', long = "mode", default_value = "auto")]
     mode: String,
-    /// Engine override (a module from the list below).
-    #[arg(short = 'e', long = "engine", value_name = "ENGINE")]
-    engine: Option<String>,
+    /// Engine override (a module from the list below). A number instead sets
+    /// the gap mode, as Prodigal's own -e does (-e 0|1|2; e.g. -e prodigal -e 1).
+    #[arg(short = 'e', long = "engine", value_name = "ENGINE|0|1|2")]
+    engine: Vec<String>,
     /// Genetic code: an NCBI table number or "auto".
     #[arg(short = 'g', long = "code", value_name = "CODE|auto")]
     code: Option<String>,
+    /// Gap handling for runs of >= 10 N (prodigal engines): 0 = partial genes
+    /// run into gaps (default); 1 = genes cannot run into gaps; 2 = N's are not gaps.
+    #[arg(long = "gap-mode", value_name = "0|1|2")]
+    gap_mode: Option<String>,
+    /// Prodigal 2.x -m: no gene is built across or into a run of >= 50 N
+    /// (prodigal engines).
+    #[arg(short = 'm', long = "mask", default_value_t = false)]
+    mask: bool,
     /// Skip tRNA / rRNA detection.
     #[arg(long = "no-rna", default_value_t = false)]
     no_rna: bool,
@@ -263,13 +300,14 @@ struct TranslateArgs {
     /// Instead of six-frame protein FASTA, list six-frame ORFs.
     #[arg(long = "orfs", default_value_t = false)]
     orfs: bool,
-    /// Output format for --orfs: gff3 | faa | fna | tsv (default faa).
+    /// Output format for --orfs: gff3 | gtf | genbank | faa | fna | tsv (default faa).
     #[arg(short = 'f', long = "format", default_value = "faa")]
     format: String,
     /// Minimum ORF length for --orfs (nt).
     #[arg(short = 'l', long = "minlen", default_value_t = 90)]
     minlen: usize,
-    /// Require a start codon for --orfs (otherwise list all stop-to-stop ORFs).
+    /// Require a start codon for --orfs (otherwise list all stop-to-stop ORFs,
+    /// start-less ones flagged 5'-partial).
     #[arg(long = "require-start", default_value_t = false)]
     require_start: bool,
 }
@@ -357,6 +395,64 @@ fn write_out(output: &Option<PathBuf>, buf: &str) -> Result<()> {
     }
 }
 
+/// Pre-flight warnings for a gene-calling run (stderr only).
+fn warn_run(mode: Mode, engine: Option<EngineKind>, code: &CodeChoice, records: &[Record], gap_given: bool) {
+    let eng = engine.unwrap_or_else(|| dynamite::model::config_for(mode).engine);
+    if gap_given && !dynamite::engine_supports_gap_mode(eng) {
+        eprintln!(
+            "dynamite: warning: gap modes (-e 0|1|2, --gap-mode, -m) apply to the prodigal, prodigalgv and \
+             prodigal-meta engines; {} always splits contigs at gaps (gap mode 0)",
+            eng.label()
+        );
+    }
+    if eng == EngineKind::FragGeneScan {
+        match code {
+            CodeChoice::Fixed(n) if *n != 11 => eprintln!(
+                "dynamite: warning: the FragGeneScan HMM is trained for code 11; -g {n} is ignored by this engine"
+            ),
+            CodeChoice::Auto => eprintln!(
+                "dynamite: warning: the FragGeneScan HMM is trained for code 11; -g auto is ignored by this engine"
+            ),
+            _ => {}
+        }
+    }
+    // Sequence ids name the records in every output format; same-named records
+    // are called separately but cannot be told apart downstream.
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut dup_set = std::collections::HashSet::new();
+        let mut dups: Vec<&str> = Vec::new();
+        for r in records {
+            if !seen.insert(r.id.as_str()) && dup_set.insert(r.id.as_str()) {
+                dups.push(r.id.as_str());
+            }
+        }
+        if !dups.is_empty() {
+            let shown: Vec<&str> = dups.iter().take(5).copied().collect();
+            eprintln!(
+                "dynamite: warning: {} sequence id(s) occur more than once ({}{}); outputs identify sequences \
+                 by id, so give each record a unique id",
+                dups.len(),
+                shown.join(", "),
+                if dups.len() > 5 { ", …" } else { "" }
+            );
+        }
+    }
+    if matches!(eng, EngineKind::Prodigal | EngineKind::ProdigalGv | EngineKind::ProdigalMeta) {
+        let bases: usize = records
+            .iter()
+            .map(|r| r.seq.iter().filter(|&&b| !dynamite::seq::is_ambiguous_byte(b)).count())
+            .sum();
+        if bases < 20_000 {
+            eprintln!(
+                "dynamite: warning: the {} engine self-trains on the input, but only {bases} bp were given \
+                 (Prodigal needs >= 20,000 bp to train); gene calls and genetic-code detection may be unreliable",
+                eng.label()
+            );
+        }
+    }
+}
+
 fn parse_code(s: Option<&str>) -> Result<CodeChoice> {
     Ok(match s {
         None => CodeChoice::Default,
@@ -370,6 +466,84 @@ fn parse_code(s: Option<&str>) -> Result<CodeChoice> {
     })
 }
 
+/// Resolve the `-e/--engine` values — an engine name, or Prodigal's `-e`
+/// gap mode `0|1|2` — together with `--gap-mode` and `-m/--mask`. Returns the
+/// engine override, the gap mode, and whether a gap option was given.
+fn parse_engine_and_gaps(
+    values: &[String],
+    gap_mode: Option<&str>,
+    mask: bool,
+) -> Result<(Option<EngineKind>, GapMode, bool)> {
+    let mut engine: Option<EngineKind> = None;
+    let mut gap: Option<GapMode> = None;
+    let mut first = String::new();
+    let mut set_gap = |g: GapMode, what: String| -> Result<()> {
+        match gap {
+            Some(prev) if prev != g => Err(anyhow!("conflicting gap modes: {first} and {what}")),
+            Some(_) => Ok(()),
+            None => {
+                gap = Some(g);
+                first = what;
+                Ok(())
+            }
+        }
+    };
+    for v in values {
+        if let Some(g) = GapMode::from_prodigal_e(v) {
+            set_gap(g, format!("-e {}", v.trim()))?;
+        } else {
+            let e = EngineKind::parse(v).ok_or_else(|| {
+                anyhow!(
+                    "unknown engine '{v}' (try: phanotate, prodigal, prodigalgv, prodigal-meta, genemark, augustus, \
+                     fraggenescan — or a gap mode 0, 1, 2)"
+                )
+            })?;
+            if engine.is_some_and(|prev| prev != e) {
+                return Err(anyhow!("more than one engine given with -e/--engine"));
+            }
+            engine = Some(e);
+        }
+    }
+    if let Some(v) = gap_mode {
+        let g = GapMode::from_prodigal_e(v)
+            .ok_or_else(|| anyhow!("invalid --gap-mode '{v}' (expected 0, 1 or 2)"))?;
+        set_gap(g, format!("--gap-mode {}", v.trim()))?;
+    }
+    if mask {
+        if gap.is_some() {
+            return Err(anyhow!(
+                "-m/--mask (Prodigal 2.x masking) and a gap mode (-e 0|1|2, --gap-mode) are alternatives; give one"
+            ));
+        }
+        return Ok((engine, GapMode::Mask, true));
+    }
+    Ok((engine, gap.unwrap_or_default(), gap.is_some()))
+}
+
+/// ` gap-mode=…` for the run summary when it is not the default.
+fn gap_note(engine: EngineKind, gap: GapMode) -> String {
+    if gap != GapMode::Partial && dynamite::engine_supports_gap_mode(engine) {
+        match gap {
+            GapMode::Mask => " gap-mode=mask(-m)".to_string(),
+            GapMode::Closed => " gap-mode=1".to_string(),
+            GapMode::NoGaps => " gap-mode=2".to_string(),
+            GapMode::Partial => String::new(),
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn engine_kind_of(engine: dynamite::gene::Engine) -> Option<EngineKind> {
+    use dynamite::gene::Engine as E;
+    Some(match engine {
+        E::Prodigal => EngineKind::Prodigal,
+        E::ProdigalGv => EngineKind::ProdigalGv,
+        E::ProdigalMeta => EngineKind::ProdigalMeta,
+        _ => return None,
+    })
+}
+
 fn cmd_call(a: CallArgs) -> Result<()> {
     let mode = Mode::parse(&a.mode).ok_or_else(|| {
         anyhow!(
@@ -377,22 +551,19 @@ fn cmd_call(a: CallArgs) -> Result<()> {
             a.mode
         )
     })?;
-    let engine = match a.engine.as_deref() {
-        None => None,
-        Some(s) => Some(EngineKind::parse(s).ok_or_else(|| {
-            anyhow!(
-                "unknown engine '{s}' (try: phanotate, prodigal, prodigalgv, prodigal-meta, genemark, augustus, fraggenescan)"
-            )
-        })?),
-    };
+    let (engine, gap, gap_given) = parse_engine_and_gaps(&a.engine, a.gap_mode.as_deref(), a.mask)?;
     let format = Format::parse(&a.format)
-        .ok_or_else(|| anyhow!("unknown format '{}' (try: gff3, genbank, faa, fna, tsv)", a.format))?;
+        .ok_or_else(|| anyhow!("unknown format '{}' (try: gff3, gtf, genbank, faa, fna, ffn, tsv)", a.format))?;
     let code = parse_code(a.code.as_deref())?;
     if a.circular && a.closed {
         return Err(anyhow!("--circular and --closed are mutually exclusive"));
     }
+    if a.circular {
+        eprintln!("dynamite: note: --circular is accepted for compatibility; genes are not wrapped across the origin");
+    }
 
     let (_path, records) = read_input(a.input, a.input_pos)?;
+    warn_run(mode, engine, &code, &records, gap_given);
     let cfg = RunConfig {
         mode,
         engine,
@@ -401,18 +572,29 @@ fn cmd_call(a: CallArgs) -> Result<()> {
         closed: a.closed,
         threads: a.threads,
     };
-    let out = run_records(&records, &cfg)?;
+    let out = run_records_with(&records, &cfg, &RunOptions::default().with_gap_mode(gap))?;
 
     let mut buf = String::new();
-    dynamite::gene::write_all(&mut buf, &out.genes, format, &out.contigs);
+    if format == Format::Genbank {
+        // A GenBank record needs its sequence (ORIGIN); the coordinate-only
+        // writer produced records that GenBank parsers reject.
+        let seqs: Vec<(String, Vec<u8>)> = records
+            .iter()
+            .map(|r| (r.id.clone(), r.seq.iter().map(|b| b.to_ascii_uppercase()).collect()))
+            .collect();
+        dynamite::gene::write_genbank_full(&mut buf, &out.genes, &seqs);
+    } else {
+        dynamite::gene::write_all(&mut buf, &out.genes, format, &out.contigs);
+    }
 
     eprintln!(
-        "dynamite: mode={} engine={} code={} contigs={} genes={}",
+        "dynamite: mode={} engine={} code={} contigs={} genes={}{}",
         mode.label(),
         out.engine.label(),
         out.trans_table,
         out.contigs.len(),
         out.genes.len(),
+        engine_kind_of(out.engine).map(|k| gap_note(k, gap)).unwrap_or_default(),
     );
     write_out(&a.output, &buf)
 }
@@ -420,12 +602,10 @@ fn cmd_call(a: CallArgs) -> Result<()> {
 fn cmd_all(a: AllArgs) -> Result<()> {
     let mode = Mode::parse(&a.mode)
         .ok_or_else(|| anyhow!("unknown mode '{}' (see `dynamite call --help`)", a.mode))?;
-    let engine = match a.engine.as_deref() {
-        None => None,
-        Some(s) => Some(EngineKind::parse(s).ok_or_else(|| anyhow!("unknown engine '{s}'"))?),
-    };
+    let (engine, gap, gap_given) = parse_engine_and_gaps(&a.engine, a.gap_mode.as_deref(), a.mask)?;
     let code = parse_code(a.code.as_deref())?;
     let (_path, records) = read_input(a.input, a.input_pos)?;
+    warn_run(mode, engine, &code, &records, gap_given);
     let cfg = RunConfig {
         mode,
         engine,
@@ -434,7 +614,7 @@ fn cmd_all(a: AllArgs) -> Result<()> {
         closed: a.closed,
         threads: a.threads,
     };
-    let out = run_records(&records, &cfg)?;
+    let out = run_records_with(&records, &cfg, &RunOptions::default().with_gap_mode(gap))?;
 
     std::fs::create_dir_all(&a.outdir)
         .map_err(|e| anyhow!("cannot create outdir {:?}: {e}", a.outdir))?;
@@ -487,8 +667,9 @@ fn cmd_all(a: AllArgs) -> Result<()> {
     write("fna", &s)?;
 
     eprintln!(
-        "dynamite all: engine={} contigs={} genes={} -> {}/{}.{{gff,gtf,gbk,faa,ffn,fna,tsv}}",
+        "dynamite all: engine={}{} contigs={} genes={} -> {}/{}.{{gff,gtf,gbk,faa,ffn,fna,tsv}}",
         out.engine.label(),
+        engine_kind_of(out.engine).map(|k| gap_note(k, gap)).unwrap_or_default(),
         out.contigs.len(),
         out.genes.len(),
         a.outdir.display(),
@@ -500,14 +681,10 @@ fn cmd_all(a: AllArgs) -> Result<()> {
 fn cmd_annotate(a: AnnotateArgs) -> Result<()> {
     let mode = Mode::parse(&a.mode)
         .ok_or_else(|| anyhow!("unknown mode '{}' (see `dynamite call --help`)", a.mode))?;
-    let engine = match a.engine.as_deref() {
-        None => None,
-        Some(s) => Some(
-            EngineKind::parse(s).ok_or_else(|| anyhow!("unknown engine '{s}'"))?,
-        ),
-    };
+    let (engine, gap, gap_given) = parse_engine_and_gaps(&a.engine, a.gap_mode.as_deref(), a.mask)?;
     let code = parse_code(a.code.as_deref())?;
     let (_path, records) = read_input(a.input, a.input_pos)?;
+    warn_run(mode, engine, &code, &records, gap_given);
 
     let locus_prefix = a
         .locus
@@ -533,7 +710,7 @@ fn cmd_annotate(a: AnnotateArgs) -> Result<()> {
         rna_code,
     };
 
-    let bundle = annotate(&records, &cfg)?;
+    let bundle = annotate_with(&records, &cfg, &RunOptions::default().with_gap_mode(gap))?;
 
     std::fs::create_dir_all(&a.outdir)
         .map_err(|e| anyhow!("cannot create outdir {:?}: {e}", a.outdir))?;
@@ -585,7 +762,15 @@ fn cmd_translate(a: TranslateArgs) -> Result<()> {
             genes.extend(sixframe::orfs(&r.id, &s, &code, a.minlen, a.require_start));
             contigs.push((r.id.clone(), r.seq.len()));
         }
-        dynamite::gene::write_all(&mut buf, &genes, format, &contigs);
+        if format == Format::Genbank {
+            let seqs: Vec<(String, Vec<u8>)> = records
+                .iter()
+                .map(|r| (r.id.clone(), r.seq.iter().map(|b| b.to_ascii_uppercase()).collect()))
+                .collect();
+            dynamite::gene::write_genbank_full(&mut buf, &genes, &seqs);
+        } else {
+            dynamite::gene::write_all(&mut buf, &genes, format, &contigs);
+        }
         eprintln!("dynamite: translate --orfs code={} contigs={} orfs={}", a.code, records.len(), genes.len());
     } else {
         for r in &records {
@@ -638,13 +823,14 @@ fn cmd_rna(a: RnaArgs) -> Result<()> {
         .ok_or_else(|| anyhow!("unsupported genetic code {}", a.code))?;
     let (_path, records) = read_input(a.input, a.input_pos)?;
 
-    let mut buf = String::new();
+    // One GFF3 header for the whole file (it used to be repeated per contig).
+    let mut buf = String::from("##gff-version 3\n");
     let mut total = 0usize;
     for r in &records {
         let s = dynamite::seq::Seq::from_ascii(&r.seq);
         let feats = rna::find_all(&s, &code);
         total += feats.len();
-        buf.push_str(&rna::to_gff(&r.id, &feats));
+        buf.push_str(&rna::to_gff_records(&r.id, &feats));
     }
     eprintln!(
         "dynamite: rna — {} features across {} contigs (heuristic; verify with tRNAscan-SE / barrnap)",

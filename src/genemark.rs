@@ -15,7 +15,7 @@ use crate::dedup::resolve_overlaps;
 use crate::gencode::GeneticCode;
 use crate::gene::{Engine, Gene};
 use crate::markov::MarkovModel;
-use crate::orf::{find_orfs, OrfCand};
+use crate::orf::{find_gene_orfs, OrfCand};
 use crate::seq::Seq;
 
 const MIN_ORF: usize = 90;
@@ -34,76 +34,56 @@ pub fn call(contigs: &[(String, Seq)], fixed: Option<u32>, closed: bool) -> (Vec
     };
     let require_start = closed; // closed → starts only; open → keep edge ORFs too
 
-    // 1) Enumerate ORFs per contig.
+    // 1) Enumerate ORFs per contig; remember which contig each training ORF
+    //    came from (coordinates are contig-local).
     let mut per_contig: Vec<Vec<OrfCand>> = Vec::with_capacity(contigs.len());
-    let mut training: Vec<(usize, usize, i8)> = Vec::new();
+    let mut training: Vec<Vec<(usize, usize, i8)>> = Vec::with_capacity(contigs.len());
     for (_, s) in contigs {
-        let cands = find_orfs(s, &code, MIN_ORF, require_start, !require_start);
-        for c in &cands {
-            if c.end - c.begin + 1 >= TRAIN_MIN && !c.partial_left && !c.partial_right {
-                training.push((c.begin, c.end, c.strand));
-            }
-        }
+        let cands = find_gene_orfs(s, &code, MIN_ORF, require_start, !require_start);
+        let local: Vec<(usize, usize, i8)> = cands
+            .iter()
+            .filter(|c| c.end - c.begin + 1 >= TRAIN_MIN && !c.partial_left && !c.partial_right)
+            .map(|c| (c.begin, c.end, c.strand))
+            .collect();
+        training.push(local);
         per_contig.push(cands);
     }
 
     // 2) Train the coding model. Fall back to a lower length bar if too sparse.
-    if training.len() < 10 {
-        training.clear();
-        for ((_, s), cands) in contigs.iter().zip(&per_contig) {
-            let _ = s;
-            for c in cands {
-                if c.end - c.begin + 1 >= MIN_ORF + 60 {
-                    training.push((c.begin, c.end, c.strand));
-                }
-            }
+    if training.iter().map(|t| t.len()).sum::<usize>() < 10 {
+        for (t, cands) in training.iter_mut().zip(&per_contig) {
+            *t = cands
+                .iter()
+                .filter(|c| c.end - c.begin + 1 >= MIN_ORF + 60)
+                .map(|c| (c.begin, c.end, c.strand))
+                .collect();
         }
     }
 
-    // Train the coding model on the pooled long ORFs.
-    let model = train_pooled(contigs, &training);
+    // Train one model on the long ORFs pooled across every contig.
+    let sets: Vec<crate::markov::TrainingSet<'_>> = contigs
+        .iter()
+        .zip(&training)
+        .map(|((_, s), t)| (s, t.as_slice()))
+        .collect();
+    let model = MarkovModel::train_pooled(&sets);
 
     // 3) Score every ORF; keep coding ones (LLR > 0). IDs are per-contig.
     let mut genes = Vec::new();
     for ((name, s), cands) in contigs.iter().zip(&per_contig) {
-        let mut id = 0usize;
+        let mut local = Vec::new();
         for c in cands {
             let llr = model.llr(s, c.begin, c.end, c.strand);
             if llr <= 0.0 {
                 continue;
             }
-            id += 1;
-            let mut g = build_gene(s, &code, c, llr, id);
+            let mut g = build_gene(s, &code, c, llr, local.len() + 1);
             g.contig = name.clone();
-            genes.push(g);
+            local.push(g);
         }
+        genes.extend(crate::finalize::finalize_genes(local, s, &code, closed, crate::finalize::SeqSource::Genome, crate::finalize::StartRule::Table));
     }
     (resolve_overlaps(genes, MAX_OVERLAP), tt)
-}
-
-fn train_pooled(contigs: &[(String, Seq)], training: &[(usize, usize, i8)]) -> MarkovModel {
-    // Train on the contig that contains the most training ORFs; for the common
-    // single-contig case this is exact. (A fully pooled multi-contig model would
-    // need concatenation; the single-genome path is the primary use.)
-    if contigs.len() == 1 {
-        return MarkovModel::train(&contigs[0].1, training);
-    }
-    // Multi-contig: train per contig on its own ORFs and keep the richest model.
-    let mut best: Option<MarkovModel> = None;
-    let mut best_n = 0usize;
-    for (_, s) in contigs {
-        let local: Vec<(usize, usize, i8)> = training
-            .iter()
-            .filter(|&&(b, e, _)| e <= s.len() && b >= 1)
-            .copied()
-            .collect();
-        let m = MarkovModel::train(s, &local);
-        if m.trained_on >= best_n {
-            best_n = m.trained_on;
-            best = Some(m);
-        }
-    }
-    best.unwrap_or_else(|| MarkovModel::train(&contigs[0].1, training))
 }
 
 fn build_gene(seq: &Seq, code: &GeneticCode, c: &OrfCand, llr: f64, id: usize) -> Gene {
@@ -134,12 +114,17 @@ fn build_gene(seq: &Seq, code: &GeneticCode, c: &OrfCand, llr: f64, id: usize) -
 }
 
 fn gc_of(nt: &str) -> f64 {
-    if nt.is_empty() {
+    // GC over unambiguous bases only (N is neither GC nor AT).
+    let acgt = nt
+        .bytes()
+        .filter(|b| matches!(b, b'a' | b'A' | b'c' | b'C' | b'g' | b'G' | b't' | b'T'))
+        .count();
+    if acgt == 0 {
         return 0.0;
     }
     let gc = nt
         .bytes()
         .filter(|b| matches!(b, b'g' | b'G' | b'c' | b'C'))
         .count();
-    gc as f64 / nt.len() as f64
+    gc as f64 / acgt as f64
 }

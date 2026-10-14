@@ -179,8 +179,19 @@ const LSU_MOTIFS: &[&str] = &[
 pub fn find_rrnas(seq: &Seq) -> Vec<RnaFeature> {
     let mut out = Vec::new();
     let n = seq.len();
-    let fwd: Vec<u8> = seq.fwd.iter().map(|&b| decode_base(b)).collect();
-    let rev: Vec<u8> = seq.rev.iter().map(|&b| decode_base(b)).collect();
+    // Ambiguous bases stay `N` so they can never complete a motif.
+    let fwd: Vec<u8> = seq.to_ascii_upper();
+    let rev: Vec<u8> = fwd
+        .iter()
+        .rev()
+        .map(|&b| match b {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            _ => b'N',
+        })
+        .collect();
     for (strand, hay) in [(1i8, &fwd), (-1i8, &rev)] {
         let s = String::from_utf8_lossy(hay).to_lowercase();
         for (kind, motifs, span) in [
@@ -246,10 +257,18 @@ fn dedup_overlaps(feats: &mut Vec<RnaFeature>) {
     *feats = kept;
 }
 
-/// Render features as GFF3.
+/// Render features as a complete GFF3 document (header + records).
 pub fn to_gff(contig: &str, feats: &[RnaFeature]) -> String {
-    use std::fmt::Write as _;
     let mut out = String::from("##gff-version 3\n");
+    out.push_str(&to_gff_records(contig, feats));
+    out
+}
+
+/// Render features as GFF3 records only (no `##gff-version` header), for
+/// concatenating several contigs into one valid GFF3 file.
+pub fn to_gff_records(contig: &str, feats: &[RnaFeature]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
     for (i, f) in feats.iter().enumerate() {
         let _ = writeln!(
             out,

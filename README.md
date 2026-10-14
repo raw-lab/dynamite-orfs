@@ -18,9 +18,9 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.0-success)](https://github.com/raw-lab/dynamite)
+[![Version](https://img.shields.io/badge/version-1.1.0-success)](https://github.com/raw-lab/dynamite)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey)](https://github.com/raw-lab/dynamite)
-[![Single binary](https://img.shields.io/badge/single%20binary-~1.3%20MB-brightgreen)](https://github.com/raw-lab/dynamite)
+[![Single binary](https://img.shields.io/badge/single%20binary-~8%20MB-brightgreen)](https://github.com/raw-lab/dynamite)
 
 *One pure-Rust binary that finds genes in phages, viruses, giant viruses, crassphages,*
 *bacteria, archaea, eukaryotes — and raw sequencing reads.*
@@ -42,8 +42,9 @@ codon bias, and RNA genes.
 ## ⚡ Quick start
 
 ```sh
-# install from crates.io
-cargo install dynamite
+# install from crates.io (the crate is `dynamite-orfs`; it installs the `dynamite` binary —
+# note `cargo install dynamite` would fetch an unrelated crate)
+cargo install dynamite-orfs --locked
 
 # …or from a local checkout (use --locked for the known-good, reproducible dependency set)
 cargo install --path . --locked
@@ -93,12 +94,12 @@ Want a specific engine instead of a mode? Use `-e/--engine`. Force a genetic cod
 | `prodigal-meta` | Prodigal `-p meta` | fragmented / mixed metagenomes |
 | `genemark` | GeneMark (3-periodic Markov) | a fast Markov second opinion |
 | `augustus` | AUGUSTUS (eukaryotic) | single-exon eukaryotic CDS |
-| `fraggenescan` | **FragGeneScanRs (vendored HMM)** | short & long, error-prone reads |
+| `fraggenescan` | **FragGeneScanRs (vendored HMM)** | short & long reads, gene fragments |
 
 The three `prodigal*` presets share one validated Prodigal dynamic-programming core; `genemark`
 reuses its 3-periodic Markov coding model. **`fraggenescan` is different in kind:** rather than a
 re-implementation, DYNAMITE *vendors* the real [FragGeneScanRs](https://github.com/unipept/FragGeneScanRs)
-HMM (forward/Viterbi decode, frameshift handling, original trained models embedded via
+HMM (forward/Viterbi decode, original trained models embedded via
 `include_bytes!`) — so its output is **bit-for-bit identical** to FragGeneScanRs. Every engine is
 pure Rust; DYNAMITE never shells out to an external binary. Run `dynamite call --help` for the full
 engine→module map.
@@ -119,7 +120,32 @@ dynamite doctor                                                # environment + s
 
 **Output formats** (`-f`): `gff3` · `gtf` · `genbank` · `faa` (proteins) · `fna` (gene nucleotides;
 alias `ffn`) · `tsv`. Input is nucleotide FASTA — **contigs, short reads, or long reads** — plain or
-gzip-compressed (detected by content). `-t/--threads` parallelises by contig.
+gzip-compressed (detected by content). `-t/--threads` parallelises by contig. Give every record a
+unique id: outputs identify sequences by id (DYNAMITE warns about duplicates).
+
+**Partial genes & assembly gaps.** Every engine reports partial genes the Prodigal way:
+`partial=XY` where `X` is the **left** (lower-coordinate) end and `Y` the **right** end, on *both*
+strands (`1` = incomplete), with `<`/`>` on the same ends in GenBank and 5′/3′ columns in the NCBI
+`.tbl`. A gene is 5′-partial unless it begins with a start codon of the active genetic code (a start
+in the first codon of an open contig end counts as partial, as in Prodigal) and 3′-partial unless it
+ends with a stop codon; 5′-partial genes get `start_type=Edge`. N / IUPAC bases never form start or
+stop codons and translate to `X`. Runs of ≥ 10 N are treated as **assembly gaps**: contigs are split
+there, so no gene spans, starts in or ends in a gap — genes that run into one are truncated at their
+last full codon and flagged partial on that side. Self-training still sees the contigs exactly as
+given (as Prodigal does), so genes away from a gap are the ones Prodigal calls on the same sequence.
+
+**Gap handling for the Prodigal engines** (`prodigal`, `prodigalgv`, `prodigal-meta`) follows
+Prodigal's own options. The other engines always use mode `0`.
+
+| Option | Prodigal | What happens at a run of N |
+|---|---|---|
+| `--gap-mode 0` *(default)* | `-e 0` | ≥ 10 N is a gap; partial genes run into it as into a contig end (as if the contig were cut there) |
+| `--gap-mode 1` | `-e 1` | ≥ 10 N is a gap; genes cannot run into it — every gene next to a gap has its own start and stop codon |
+| `--gap-mode 2` | `-e 2`, or 2.x without `-m` | N's are not gaps: genes may span them (`X` in the protein) — identical to Prodigal 2.6.3 / pyrodigal |
+| `-m`, `--mask` | 2.x `-m` | ≥ 50 N is masked: no gene is built across or into it, in training and prediction — identical to pyrodigal `mask=True` |
+
+DYNAMITE's `-e` already picks the engine, so it also accepts Prodigal's spelling: a number given to
+`-e` is the gap mode (`-e 1`, or `-e prodigal -e 1` for both).
 
 ## 🗂️ Every format at once — the `all` command
 
@@ -158,8 +184,10 @@ dynamite all -i contigs.fna -e prodigalgv -g 11 --closed -t 8 -o out/ --prefix s
 | `-o, --outdir <DIR>` | `dynamite_out` | Directory to write the files into (created if missing). |
 | `--prefix <NAME>` | `dynamite` | Base name shared by every output file (`{prefix}.gff`, `{prefix}.faa`, …). |
 | `-p, --mode <MODE>` | `auto` | `phage`·`virus`·`giant-virus`·`crassphage`·`bacteria`·`archaea`·`meta`·`eukaryote`·`reads`·`long-reads`·`auto` |
-| `-e, --engine <ENGINE>` | from `--mode` | Force an engine: `phanotate`·`prodigal`·`prodigalgv`·`prodigal-meta`·`genemark`·`augustus`·`fraggenescan` |
+| `-e, --engine <ENGINE>` | from `--mode` | Force an engine: `phanotate`·`prodigal`·`prodigalgv`·`prodigal-meta`·`genemark`·`augustus`·`fraggenescan` (a number `0`/`1`/`2` sets the gap mode instead, as Prodigal's `-e`) |
 | `-g, --code <CODE\|auto>` | from `--mode` | NCBI translation-table number (e.g. `11`) or `auto` to detect. |
+| `--gap-mode <0\|1\|2>` | `0` | Prodigal engines: how runs of N are handled (see *Gap handling* above). |
+| `-m, --mask` | off | Prodigal engines: Prodigal 2.x `-m` — no gene across or into ≥ 50 N. |
 | `--closed` | off | Require complete genes only (no genes running off contig ends). |
 | `-l, --minlen <NT>` | `0` | Minimum ORF length in nt (PHANOTATE engine only). |
 | `-t, --threads <N>` | `0` | Worker threads; `0` = all CPU cores. |
@@ -198,22 +226,43 @@ ncRNA annotation.)
 
 ## ✅ Validation
 
-DYNAMITE is benchmarked against the upstream tools it learns from. Every called protein is also
-re-translated from the genome and checked — **0 internal stops, 0 coordinate mismatches** across all
-engines on phage λ (both strands).
+Measured with **pyrodigal 3.7.1** (the reference Prodigal implementation), **pyrodigal-gv 0.3.2** and
+Biopython. Every called protein is re-translated from the genome and every partial flag is checked
+against the actual start / stop codons — **0 mismatches across all seven engines** on λ (both strands,
+edge-cut contigs, 15 inserted N-gaps, scattered IUPAC codes, 300 bp reads with N runs), *Kutzneria*
+KK037166 and *E. coli* MIIJ01000039 (real assembly gaps), *E. coli* K-12 with 20 × 100-N gaps, phage
+Topaz (code 15) and *Yersinia* phage vB_YenM_201.16. No gene starts in, ends in or spans a gap. Gaps
+change nothing away from them: genes more than 1 kb from a gap are identical to Prodigal's on the same
+gapped sequence (4,263 / 4,263 on *E. coli*).
 
-![DYNAMITE benchmark vs upstream callers](docs/benchmark.png)
+- **`prodigal` ≡ Prodigal.** On *E. coli* K-12 MG1655, *C. diphtheriae* NCTC11397, *M. mycoides* GM12
+  (table 4), phage Agate (table 15), metagenomic contig SRR492066, *Acinetobacter* phage Apostate,
+  *Yersinia* phage vB_YenM_201.16 and λ (plus two edge-cut / reverse-complemented λ contigs), DYNAMITE's
+  calls are **identical to Prodigal for all 8,248 genes** — coordinates, strand, `partial=`,
+  `start_type`, `rbs_motif`, `rbs_spacer` and protein sequence (the trained model is bit-identical).
+  Draft assemblies train exactly as Prodigal does (contigs joined by `TTAATTAATTAA` linkers, one after
+  the last too): a 50-contig *E. coli* and a 12-contig *C. diphtheriae* draft give identical calls.
+- **Gap modes ≡ Prodigal.** `--gap-mode 2` is identical to Prodigal 2.6.3 (pyrodigal) and `-m` to
+  pyrodigal `mask=True` — coordinates, `partial=`, start type, RBS and protein, with and without
+  `--closed` — on λ with 7 or 15 gaps and IUPAC runs, a multi-record set with leading / trailing /
+  all-N records, λ with 2–5 kb terminal gaps, *E. coli* MIIJ01000039 (one 433 kb N-run), an 8-contig
+  *Mycoplasma* (table 4) and *E. coli* K-12 with 20 gaps (4,319 and 4,322 genes). `--gap-mode 1`
+  lets no gene run into a gap on any of them. (*Kutzneria* KK037166 differs in every mode because
+  Prodigal classes it as non-Shine–Dalgarno; see the caveats.)
+- **Genetic-code detection** (`virus` / `giant-virus` / `crassphage` / `meta` / `auto`, and any engine
+  with `-g auto`): λ, *E. coli* and 14 further phages → **11**; four *Mycoplasma mycoides* genomes →
+  **4**; phages Agate and Topaz → **15** — the same tables pyrodigal-gv reports for all 21 phage /
+  *Mycoplasma* genomes. Synthetic TGG→TGA / CAG→TAG recodings of λ and *C. diphtheriae* are detected as
+  4 / 15. Random sequence (30–70% GC) and reversed λ → 11: no false alternative code.
+- **`prodigalgv` vs Prodigal-GV.** `prodigalgv` self-trains (Prodigal single-genome mode) instead of
+  using Prodigal-GV's pre-trained metagenomic models. On λ it reproduces **85%** of pyrodigal-gv's gene
+  3′-ends and the **same start 91%** of the time where they agree — exactly the agreement real Prodigal
+  single mode has with pyrodigal-gv.
+- **`fraggenescan` == FragGeneScanRs.** Because DYNAMITE vendors the real HMM, gene intervals and strands
+  are **identical** to FragGeneScanRs on gap-free input (183/183 genes on 161 × 300 bp λ reads).
 
-- **`prodigalgv` ≈ Prodigal-GV.** On λ it reproduces **84%** of Prodigal-GV's gene 3′-ends, and where
-  they agree on a gene it picks the **same start 92%** of the time — it *is* the Prodigal DP engine
-  underneath. On phiX174 it recovers **100%** of Prodigal-GV's stops.
-- **`fraggenescan` == FragGeneScanRs.** Because DYNAMITE vendors the real HMM, its read calls are
-  **100% identical** to FragGeneScanRs — on 161 × 300 bp λ reads both emit the same **183 genes with
-  identical intervals and strands**. (The figure's "single-strand decode" panel shows the earlier
-  from-scratch heuristic that this vendored HMM replaced.)
-
-*(Reproduce: build Prodigal-GV and `cargo install frag_gene_scan_rs`, run both on the same FASTA,
-compare GFF 3′-ends.)*
+*(Reproduce: `pip install pyrodigal pyrodigal-gv`, run them and DYNAMITE on the same FASTA, compare
+GFF coordinates / `partial=` / proteins. `cargo test` runs the λ / Topaz regression suite.)*
 
 ## 🔬 Codon stats & `rustyomestats`
 
@@ -242,8 +291,20 @@ DYNAMITE is faithful **in spirit** to its namesakes; some engines are deliberate
 
 - **`phanotate`** reproduces PHANOTATE's phiX174 calls *and* path scores to ~7 significant figures.
 - **`prodigal` / `prodigalgv` / `prodigal-meta`** are a Rust port of the Prodigal / Prodigal-GV DP core
-  (self-trained coding model, Shine–Dalgarno RBS scoring, start tweaking) with standard-code-biased
-  genetic-code auto-detection. Validated against Prodigal-GV (see above).
+  (self-trained coding model, Shine–Dalgarno RBS scoring, start tweaking). For Shine–Dalgarno organisms
+  the output is identical to Prodigal (see above). Prodigal's *non-SD* start trainer is not
+  implemented: for organisms Prodigal classes as non-SD, start choices can differ and `rbs_motif` is
+  reported as `None`. Self-training needs sequence — below 20 kb (Prodigal's own minimum) DYNAMITE warns,
+  and genetic-code auto-detection keeps the standard code.
+  <br><b>Genetic-code auto-detection</b> self-trains under each candidate table and adopts an
+  alternative only on clear evidence: its coding density must exceed 70% and beat the standard code,
+  and every candidate that keeps a superset of its stop codons, by > 5 points (the CheckM / GTDB-Tk
+  test, generalised); the reassigned codons must be used inside genes like sense codons (5–50 per 1,000
+  codons); and at least 20% of its coding sequence must lie in genes the standard code also finds in
+  the same frame (random or non-coding sequence otherwise "gains" density under tables with fewer
+  stops). Tables that differ only in start codons (1 vs 11) or only in what a reassigned codon encodes
+  (4 vs 25) cannot be told apart from the sequence and are never auto-selected over the first-listed one
+  (or, with `-g auto`, over the engine's own table) — force them with `-g`.
   <br><b>On pyrodigal / pyrodigal-gv / pyrodigal-rv:</b> these are <i>not</i> a better algorithm —
   pyrodigal is a Cython binding to the <i>same</i> Prodigal C dynamic-programming method (bug fixes +
   a Python API). pyrodigal-<b>gv</b> and pyrodigal-<b>rv</b> only ship extra <i>pre-trained metagenomic
@@ -260,10 +321,17 @@ DYNAMITE is faithful **in spirit** to its namesakes; some engines are deliberate
 - **`fraggenescan`** is **not** a simplification — DYNAMITE vendors the actual
   [FragGeneScanRs](https://github.com/unipept/FragGeneScanRs) core (`src/fgs/`,
   GPL-3.0, unmodified algorithm) and runs its full forward/Viterbi HMM with the original embedded
-  models, including **frameshift (insertion/deletion) handling**. Output is identical to FragGeneScanRs.
-  `reads` uses the short-read/fragment decode; `long-reads` uses the same frameshift-aware decode for
-  noisy Nanopore/PacBio reads; forcing `-e fraggenescan` on assembled contigs uses the complete-genome
-  decode.
+  models. Output is identical to FragGeneScanRs run with `-t complete`. **That is FragGeneScan's
+  error-free model** (insertion / deletion transitions of 1e-18), so sequencing-error frameshifts are
+  *not* corrected — on λ reads with 0.5% insertions + 0.5% deletions, 0 of 4,580 genes were
+  frameshift-corrected. FragGeneScan's error models (`illumina_1/5/10`, `454_5/10/30`, `sanger_5/10`)
+  are embedded but not selectable yet. `reads` and `long-reads` both use the short-read/fragment
+  decode (identical calls); forcing `-e fraggenescan` on assembled contigs uses the complete-genome
+  decode. DYNAMITE adds what FragGeneScan does not report — partial flags inferred from the start /
+  stop codons — and, for genes without frameshifts, takes the nucleotide / protein strings from the
+  genome at FragGeneScan's coordinates (upstream's minus-strand start refinement moves the coordinate
+  but drops the codons in between from its own strings). The HMM is trained for code 11 only, so
+  `-g` is ignored by this engine (with a warning).
 - **`rna`** is **heuristic, not a covariance-model search.** The tRNA scanner requires a near-canonical
   cloverleaf (7-bp acceptor stem, 5/5 anticodon &amp; T-arm stems, conserved TΨC loop): high precision,
   modest sensitivity (0 false positives on phiX174 / λ; finds canonical tRNAs with the right anticodon).

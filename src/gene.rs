@@ -21,7 +21,7 @@ pub enum Engine {
     GeneMark,
     /// AUGUSTUS-style eukaryotic (intron-aware) gene finder.
     Augustus,
-    /// FragGeneScan-style codon HMM with frameshift handling (short reads).
+    /// FragGeneScan codon HMM (vendored FragGeneScanRs; short and long reads).
     FragGeneScan,
     /// Plain six-frame translation (every ORF between stops).
     SixFrame,
@@ -64,9 +64,14 @@ pub struct Gene {
     pub rbs_motif: String,
     /// RBS spacer text (e.g. `5-10bp`) or `None`.
     pub rbs_spacer: String,
-    /// Gene runs off the left edge of the contig (5' partial on its strand).
+    /// The gene is incomplete at its **left** (lower-coordinate, `begin`) end —
+    /// Prodigal's genomic convention, independent of strand. On the forward
+    /// strand that is the 5' end (no start codon); on the reverse strand it is
+    /// the 3' end (no stop codon). Use [`Gene::partial_5p`] /
+    /// [`Gene::partial_3p`] for the strand-relative view.
     pub partial_left: bool,
-    /// Gene runs off the right edge of the contig (3' partial on its strand).
+    /// The gene is incomplete at its **right** (higher-coordinate, `end`) end
+    /// (genomic convention, see `partial_left`).
     pub partial_right: bool,
     /// Total model score for the gene (engine-specific scale).
     pub score: f64,
@@ -89,14 +94,56 @@ pub struct Gene {
 }
 
 impl Gene {
-    /// Reading-frame partial flag in Prodigal's `XY` form (`1` = partial end).
+    /// Reading-frame partial flag in Prodigal's `XY` form: `X` = left (begin)
+    /// end, `Y` = right (end) end, `1` = incomplete — for **both** strands.
+    ///
+    /// (Previously the two flags were swapped for reverse-strand genes, so
+    /// `partial=` was written in 5'/3' order on the minus strand.)
     pub fn partial_str(&self) -> String {
-        let (l, r) = if self.strand >= 0 {
-            (self.partial_left, self.partial_right)
+        format!("{}{}", self.partial_left as u8, self.partial_right as u8)
+    }
+
+    /// `true` if the gene's 5' end (start-codon side) is incomplete.
+    #[inline]
+    pub fn partial_5p(&self) -> bool {
+        if self.strand >= 0 {
+            self.partial_left
         } else {
-            (self.partial_right, self.partial_left)
-        };
-        format!("{}{}", l as u8, r as u8)
+            self.partial_right
+        }
+    }
+
+    /// `true` if the gene's 3' end (stop-codon side) is incomplete.
+    #[inline]
+    pub fn partial_3p(&self) -> bool {
+        if self.strand >= 0 {
+            self.partial_right
+        } else {
+            self.partial_left
+        }
+    }
+
+    /// Set the strand-relative partial flags (stored in genomic orientation).
+    pub fn set_partial_5p_3p(&mut self, p5: bool, p3: bool) {
+        if self.strand >= 0 {
+            self.partial_left = p5;
+            self.partial_right = p3;
+        } else {
+            self.partial_left = p3;
+            self.partial_right = p5;
+        }
+    }
+
+    /// GenBank / INSDC location string, with `<` / `>` on the incomplete
+    /// genomic ends (e.g. `complement(<1..>300)`).
+    pub fn insdc_location(&self) -> String {
+        let lb = if self.partial_left { "<" } else { "" };
+        let rb = if self.partial_right { ">" } else { "" };
+        if self.strand >= 0 {
+            format!("{lb}{}..{rb}{}", self.begin, self.end)
+        } else {
+            format!("complement({lb}{}..{rb}{})", self.begin, self.end)
+        }
     }
 
     /// Start-codon text.
@@ -111,41 +158,49 @@ impl Gene {
 
     /// Extract the nucleotide coding sequence and translate it to protein,
     /// using the supplied genetic code. The leading start codon is rendered as
-    /// `M` for complete genes (matching Prodigal), and the trailing stop codon
-    /// is dropped from the protein.
+    /// `M` for genes with a complete 5' end (matching Prodigal), and the
+    /// trailing stop codon is dropped from the protein. Ambiguous bases are
+    /// written as `N` and any codon containing one translates to `X` — never
+    /// as a concrete base (N used to be read as A, e.g. `NNN` → `K`).
     pub fn fill_sequences(&mut self, seq: &Seq, code: &GeneticCode) {
         let b = self.begin.saturating_sub(1);
         let e = self.end.min(seq.len());
         if b >= e {
             return;
         }
-        let coding: Vec<u8> = if self.strand >= 0 {
-            seq.fwd[b..e].to_vec()
+        let (coding, amb): (Vec<u8>, Vec<bool>) = if self.strand >= 0 {
+            (seq.fwd[b..e].to_vec(), seq.n[b..e].to_vec())
         } else {
-            revcomp(&seq.fwd[b..e])
+            (revcomp(&seq.fwd[b..e]), seq.n[b..e].iter().rev().copied().collect())
         };
 
         // Nucleotide string.
         let mut nt = String::with_capacity(coding.len());
-        for &c in &coding {
-            nt.push(decode_base(c) as char);
+        for (&c, &a) in coding.iter().zip(amb.iter()) {
+            nt.push(if a { 'N' } else { decode_base(c) as char });
         }
         self.nt = nt;
 
         // Protein string.
         let ncodons = coding.len() / 3;
+        let p5 = self.partial_5p();
+        let p3 = self.partial_3p();
         let mut aa = String::with_capacity(ncodons);
         for k in 0..ncodons {
             let i = k * 3;
             let (c1, c2, c3) = (coding[i], coding[i + 1], coding[i + 2]);
-            let is_first = k == 0;
-            let residue = if is_first && !self.partial_left && code.is_start(c1, c2, c3) {
+            let ambiguous = amb[i] || amb[i + 1] || amb[i + 2];
+            let residue = if ambiguous {
+                b'X'
+            } else if k == 0 && !p5 && (code.is_start(c1, c2, c3) || GeneticCode::start_type(c1, c2, c3) < 3) {
+                // A complete 5' end begins with the gene's start codon, read
+                // as Met (PHANOTATE opens genes at ATG/GTG/TTG under any table).
                 b'M'
             } else {
                 code.translate(c1, c2, c3)
             };
             // Drop the final stop codon from the protein for complete 3' ends.
-            if k == ncodons - 1 && residue == b'*' && !self.partial_right {
+            if k == ncodons - 1 && residue == b'*' && !p3 {
                 break;
             }
             aa.push(residue as char);
@@ -189,6 +244,13 @@ impl Format {
             _ => None,
         }
     }
+}
+
+/// A GenBank `LOCUS` line. The name and length are always separated by
+/// whitespace (a contig id of 16+ characters used to run straight into the
+/// length, e.g. `NC_001416.1_lambda48502 bp`, which parsers reject).
+pub fn locus_line(id: &str, len: usize) -> String {
+    format!("LOCUS       {id:<16} {len:>11} bp    DNA     linear   UNK 01-JAN-2025")
 }
 
 /// FASTA-style descriptive header attributes shared by several formats.
@@ -347,27 +409,13 @@ fn write_genbank(out: &mut String, genes: &[Gene], contigs: &[(String, usize)]) 
         by_contig.entry(g.contig.as_str()).or_default().push(g);
     }
     for (id, len) in contigs {
-        let _ = writeln!(
-            out,
-            "LOCUS       {id:<16}{len} bp    DNA     linear   {date}",
-            id = id,
-            len = len,
-            date = "01-JAN-2025"
-        );
+        let _ = writeln!(out, "{}", locus_line(id, *len));
         let _ = writeln!(out, "DEFINITION  {id} DYNAMITE gene predictions.");
         out.push_str("FEATURES             Location/Qualifiers\n");
         let _ = writeln!(out, "     source          1..{len}");
         if let Some(gs) = by_contig.get(id.as_str()) {
             for g in gs {
-                let loc = if g.strand >= 0 {
-                    let lb = if g.partial_left { "<" } else { "" };
-                    let rb = if g.partial_right { ">" } else { "" };
-                    format!("{lb}{}..{rb}{}", g.begin, g.end)
-                } else {
-                    let lb = if g.partial_right { "<" } else { "" };
-                    let rb = if g.partial_left { ">" } else { "" };
-                    format!("complement({lb}{}..{rb}{})", g.begin, g.end)
-                };
+                let loc = g.insdc_location();
                 let _ = writeln!(out, "     CDS             {loc}");
                 let _ = writeln!(out, "                     /note=\"score:{:E};engine:{}\"", g.score, g.engine.label());
                 let _ = writeln!(out, "                     /transl_table={}", g.trans_table);
@@ -389,22 +437,14 @@ pub fn write_genbank_full(out: &mut String, genes: &[Gene], contigs: &[(String, 
     }
     for (id, seq) in contigs {
         let len = seq.len();
-        let _ = writeln!(out, "LOCUS       {id:<16}{len} bp    DNA     linear   01-JAN-2025");
+        let _ = writeln!(out, "{}", locus_line(id, len));
         let _ = writeln!(out, "DEFINITION  {id} DYNAMITE gene predictions.");
         let _ = writeln!(out, "ACCESSION   {id}");
         out.push_str("FEATURES             Location/Qualifiers\n");
         let _ = writeln!(out, "     source          1..{len}");
         if let Some(gs) = by_contig.get(id.as_str()) {
             for g in gs {
-                let loc = if g.strand >= 0 {
-                    let lb = if g.partial_left { "<" } else { "" };
-                    let rb = if g.partial_right { ">" } else { "" };
-                    format!("{lb}{}..{rb}{}", g.begin, g.end)
-                } else {
-                    let lb = if g.partial_right { "<" } else { "" };
-                    let rb = if g.partial_left { ">" } else { "" };
-                    format!("complement({lb}{}..{rb}{})", g.begin, g.end)
-                };
+                let loc = g.insdc_location();
                 let _ = writeln!(out, "     CDS             {loc}");
                 let _ = writeln!(out, "                     /note=\"score:{:E};engine:{}\"", g.score, g.engine.label());
                 let _ = writeln!(out, "                     /transl_table={}", g.trans_table);

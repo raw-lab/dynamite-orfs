@@ -15,5 +15,15 @@ pub const META_CANDIDATES: &[u32] = &[11, 4, 15, 25];
 /// Run the Prodigal-meta preset. `fixed = Some(table)` forces a code; `None`
 /// auto-detects among [`META_CANDIDATES`].
 pub fn call(contigs: &[(String, Seq)], fixed: Option<u32>, closed: bool) -> (Vec<Gene>, u32) {
-    dp_call(contigs, fixed, META_CANDIDATES, true, closed, Engine::ProdigalMeta)
+    call_with_candidates(contigs, fixed, META_CANDIDATES, closed)
+}
+
+/// [`call`] with an explicit candidate list for auto-detection.
+pub fn call_with_candidates(
+    contigs: &[(String, Seq)],
+    fixed: Option<u32>,
+    candidates: &[u32],
+    closed: bool,
+) -> (Vec<Gene>, u32) {
+    dp_call(contigs, fixed, candidates, true, closed, Engine::ProdigalMeta)
 }

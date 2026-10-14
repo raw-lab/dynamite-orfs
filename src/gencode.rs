@@ -135,6 +135,35 @@ impl GeneticCode {
         }
     }
 
+    /// Bitmask over the 64 codons (bit = NCBI TCAG index) that are stop codons
+    /// under this table. Two tables with equal masks terminate ORFs identically.
+    pub fn stop_mask(&self) -> u64 {
+        let mut m = 0u64;
+        for (i, &aa) in self.aas.iter().enumerate() {
+            if aa == b'*' {
+                m |= 1u64 << i;
+            }
+        }
+        m
+    }
+
+    /// Bitmask over the 64 codons (bit = NCBI TCAG index) accepted as start
+    /// codons by [`GeneticCode::is_start`].
+    pub fn start_mask(&self) -> u64 {
+        let bases = [T, C, A, G];
+        let mut m = 0u64;
+        for &b1 in &bases {
+            for &b2 in &bases {
+                for &b3 in &bases {
+                    if self.is_start(b1, b2, b3) {
+                        m |= 1u64 << codon_index(b1, b2, b3);
+                    }
+                }
+            }
+        }
+        m
+    }
+
     /// The set of stop codons (as ASCII triples) for this table — used by the
     /// PHANOTATE-style engine, which works on codon strings.
     pub fn stop_codons_ascii(&self) -> Vec<[u8; 3]> {
@@ -209,6 +238,23 @@ mod tests {
         let c25 = GeneticCode::new(25).unwrap();
         assert_eq!(c25.translate(T, G, A), b'G');
         assert!(!c25.is_stop(T, G, A));
+    }
+
+    #[test]
+    fn stop_and_start_masks() {
+        let c11 = GeneticCode::new(11).unwrap();
+        let c1 = GeneticCode::new(1).unwrap();
+        let c4 = GeneticCode::new(4).unwrap();
+        let c25 = GeneticCode::new(25).unwrap();
+        let c15 = GeneticCode::new(15).unwrap();
+        let c6 = GeneticCode::new(6).unwrap();
+        assert_eq!(c11.stop_mask().count_ones(), 3);
+        assert_eq!(c11.stop_mask(), c1.stop_mask()); // same stops ...
+        assert_ne!(c11.start_mask(), c1.start_mask()); // ... different starts
+        assert_eq!((c4.stop_mask(), c4.start_mask()), (c25.stop_mask(), c25.start_mask()));
+        // stop-set nesting: 6 ⊂ 15 ⊂ 11
+        assert_eq!(c6.stop_mask() & c15.stop_mask(), c6.stop_mask());
+        assert_eq!(c15.stop_mask() & c11.stop_mask(), c15.stop_mask());
     }
 
     #[test]

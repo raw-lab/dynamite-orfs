@@ -11,6 +11,9 @@ use crate::seq::Seq;
 
 const NCTX: usize = 16; // 4^2 contexts (previous two bases)
 
+/// One contig and the coding ORFs (1-based `begin`, `end`, `strand`) found on it.
+pub type TrainingSet<'a> = (&'a Seq, &'a [(usize, usize, i8)]);
+
 /// A trained coding + background model.
 #[derive(Clone)]
 pub struct MarkovModel {
@@ -25,25 +28,41 @@ impl MarkovModel {
     /// Train from a set of presumed-coding ORFs (global 1-based coords + strand)
     /// against a whole-sequence background.
     pub fn train(seq: &Seq, coding: &[(usize, usize, i8)]) -> MarkovModel {
+        MarkovModel::train_pooled(&[(seq, coding)])
+    }
+
+    /// Train one model from several contigs, each paired with the coding ORFs
+    /// that were found **on that contig** (1-based coords + strand). Background
+    /// and coding counts are pooled across all of them. ORFs that do not fit
+    /// their contig are skipped (they used to be applied to the wrong contig,
+    /// which corrupted the model and could index out of bounds).
+    pub fn train_pooled(sets: &[TrainingSet<'_>]) -> MarkovModel {
         // Pseudocounts of 1 everywhere.
         let mut cod = [[[1.0f64; 4]; NCTX]; 3];
         let mut nc = [[1.0f64; 4]; NCTX];
+        let mut trained_on = 0usize;
 
-        // Background: both strands, position-independent.
-        accumulate_background(&seq.fwd, &mut nc);
-        accumulate_background(&seq.rev, &mut nc);
+        for &(seq, coding) in sets {
+            // Background: both strands, position-independent.
+            accumulate_background(&seq.fwd, &mut nc);
+            accumulate_background(&seq.rev, &mut nc);
 
-        // Coding: accumulate codon-position-specific counts.
-        let n = seq.len();
-        for &(begin, end, strand) in coding {
-            accumulate_coding(seq, n, begin, end, strand, &mut cod);
+            // Coding: accumulate codon-position-specific counts.
+            let n = seq.len();
+            for &(begin, end, strand) in coding {
+                if begin == 0 || end > n || begin > end {
+                    continue;
+                }
+                accumulate_coding(seq, n, begin, end, strand, &mut cod);
+                trained_on += 1;
+            }
         }
 
         // Normalise rows to log-probabilities.
         let mut m = MarkovModel {
             cod: [[[0.0; 4]; NCTX]; 3],
             nc: [[0.0; 4]; NCTX],
-            trained_on: coding.len(),
+            trained_on,
         };
         for ctx in 0..NCTX {
             let s: f64 = nc[ctx].iter().sum();
@@ -64,6 +83,9 @@ impl MarkovModel {
     /// inclusive). Higher = more coding.
     pub fn llr(&self, seq: &Seq, begin: usize, end: usize, strand: i8) -> f64 {
         let n = seq.len();
+        if begin == 0 || end > n || begin > end {
+            return f64::NEG_INFINITY;
+        }
         let (arr, lo, hi) = strand_window(seq, n, begin, end, strand);
         // lo..=hi are 0-based indices into `arr`, read 5'->3'.
         let mut score = 0.0;

@@ -9,8 +9,8 @@
 use crate::gencode::GeneticCode;
 use crate::gene::{Engine, Gene};
 use crate::node::{
-    add_nodes, calc_dicodon_gene, determine_sd_usage, gc_frame_plot, intergenic_mod,
-    raw_coding_score, rbs_score, record_gc_bias, record_overlapping_starts, score_nodes,
+    add_nodes_ends, add_nodes_masked, calc_dicodon_gene, determine_sd_usage, intergenic_mod,
+    raw_coding_score, rbs_score, record_gc_bias, record_overlapping_starts, score_nodes_ends,
     sort_nodes, train_starts_sd, Node, Tinf, STOP,
 };
 use crate::seq::Seq;
@@ -23,6 +23,36 @@ const MAX_NODE_DIST: isize = 500;
 /// all six reading frames, preventing ORFs from spanning contig junctions
 /// (exactly as Prodigal's `read_seq_training` does).
 pub const TRAIN_GAP: &[u8] = b"TTAATTAATTAA";
+
+/// Prodigal's Shine-Dalgarno motif / spacer labels for the 28 RBS bins
+/// (`record_gene_data`, `sd_string` / `sd_spacer`).
+const SD_STRING: [&str; 28] = [
+    "None", "GGA/GAG/AGG", "3Base/5BMM", "4Base/6BMM", "AGxAG", "AGxAG", "GGA/GAG/AGG",
+    "GGxGG", "GGxGG", "AGxAG", "AGGAG(G)/GGAGG", "AGGA/GGAG/GAGG", "AGGA/GGAG/GAGG",
+    "GGA/GAG/AGG", "GGxGG", "AGGA", "GGAG/GAGG", "AGxAGG/AGGxGG", "AGxAGG/AGGxGG",
+    "AGxAGG/AGGxGG", "AGGAG/GGAGG", "AGGAG", "AGGAG", "GGAGG", "GGAGG", "AGGAGG", "AGGAGG",
+    "AGGAGG",
+];
+const SD_SPACER: [&str; 28] = [
+    "None", "3-4bp", "13-15bp", "13-15bp", "11-12bp", "3-4bp", "11-12bp", "11-12bp", "3-4bp",
+    "5-10bp", "13-15bp", "3-4bp", "11-12bp", "5-10bp", "5-10bp", "5-10bp", "5-10bp", "11-12bp",
+    "3-4bp", "5-10bp", "11-12bp", "3-4bp", "5-10bp", "3-4bp", "5-10bp", "11-12bp", "3-4bp",
+    "5-10bp",
+];
+
+/// The `rbs_motif` / `rbs_spacer` pair Prodigal reports for a start node.
+/// DYNAMITE implements only the Shine-Dalgarno trainer, so organisms that
+/// Prodigal classes as non-SD (where it would report a de-novo motif) get
+/// `None` here.
+fn rbs_strings(node: &Node, tinf: &Tinf) -> (&'static str, &'static str) {
+    if !tinf.uses_sd {
+        return ("None", "None");
+    }
+    let rbs1 = tinf.rbs_wt[node.rbs[0]] * tinf.st_wt;
+    let rbs2 = tinf.rbs_wt[node.rbs[1]] * tinf.st_wt;
+    let bin = if rbs1 > rbs2 { node.rbs[0] } else { node.rbs[1] };
+    (SD_STRING[bin], SD_SPACER[bin])
+}
 
 /// Confidence from a model score (`calculate_confidence`).
 pub fn calculate_confidence(score: f64, start_weight: f64) -> f64 {
@@ -59,10 +89,12 @@ pub fn dprog(nodes: &mut [Node], tinf: &Tinf, flag: bool) -> i64 {
         } else {
             i_i - MAX_NODE_DIST
         };
+        // Giant-ORF exception (Prodigal `dprog`): walk `min` back to the node
+        // that sits at this ORF's other end, then allow MAX_NODE_DIST more.
         let guard = (nodes[i].strand == -1 && nodes[i].typ != STOP)
             || (nodes[i].strand == 1 && nodes[i].typ == STOP);
         if guard && nodes[min as usize].ndx >= nodes[i].stop_val {
-            while min >= 0 && nodes[i].ndx != nodes[i].stop_val {
+            while min >= 0 && nodes[min as usize].ndx != nodes[i].stop_val {
                 min -= 1;
             }
         }
@@ -285,7 +317,11 @@ fn score_connection(nodes: &mut [Node], p1: usize, p2: usize, tinf: &Tinf, flag:
             let k = sp as usize;
             let n3_stop_val = nodes[k].stop_val;
             let n3_ndx = nodes[k].ndx;
-            let cur_ovlp = left - n3_stop_val + 3;
+            // Prodigal reuses the function-level `ovlp` here, so the value from
+            // the last examined start survives the loop and feeds the flag=0
+            // (GC-frame training) score below. Reproduce that exactly.
+            ovlp = left - n3_stop_val + 3;
+            let cur_ovlp = ovlp;
             if cur_ovlp <= 0 || cur_ovlp >= MAX_OPP_OVLP {
                 continue;
             }
@@ -413,11 +449,10 @@ fn eliminate_bad_genes(nodes: &mut [Node], dbeg: i64, tinf: &Tinf) {
         return;
     }
     // Walk to the head.
-    let mut path = dbeg;
-    while nodes[path as usize].traceb != -1 {
-        path = nodes[path as usize].traceb;
+    let mut head = dbeg;
+    while nodes[head as usize].traceb != -1 {
+        head = nodes[head as usize].traceb;
     }
-    let head = path;
 
     // Apply intergenic modifiers along the chain.
     let mut path = head;
@@ -712,15 +747,24 @@ fn tweak_final_starts(genes: &mut [RawGene], nodes: &[Node], tinf: &Tinf) {
 
 /// Train a model on a (possibly concatenated) sequence under one genetic code.
 pub fn train(seq: &Seq, trans_table: u32, closed: bool) -> Tinf {
-    let code = GeneticCode::new(trans_table).expect("validated table");
-    let mut tinf = Tinf::new(trans_table, seq.gc);
+    train_masked(seq, trans_table, closed, &[])
+}
 
-    let mut nodes = add_nodes(seq, &code, closed);
+/// [`train`] with Prodigal 2.x `-m` masked regions (half-open `[begin, end)`;
+/// see [`crate::seq::ambiguous_runs`]): genes crossing a mask are not used for
+/// training, exactly as in Prodigal / pyrodigal `mask=True`.
+pub fn train_masked(seq: &Seq, trans_table: u32, closed: bool, masks: &[(usize, usize)]) -> Tinf {
+    let code = GeneticCode::new(trans_table).expect("validated table");
+    // Prodigal: unambiguous G+C over the total length (N counts only in the
+    // denominator). Identical to `seq.gc` for sequences without N.
+    let mut tinf = Tinf::new(trans_table, seq.gc_prodigal());
+
+    let mut nodes = add_nodes_masked(seq, &code, closed, masks);
     sort_nodes(&mut nodes);
     if nodes.is_empty() {
         return tinf;
     }
-    let gc = gc_frame_plot(seq);
+    let gc = crate::gcframe::most_gc_frame_prodigal(&seq.fwd);
     record_gc_bias(&gc, &mut nodes, &mut tinf);
     record_overlapping_starts(&mut nodes, &tinf, false);
     let ipath = dprog(&mut nodes, &tinf, false);
@@ -735,13 +779,40 @@ pub fn train(seq: &Seq, trans_table: u32, closed: bool) -> Tinf {
 /// Predict genes on one contig with a trained model. Returns the genes and the
 /// summed coding score (used by code auto-detection).
 pub fn predict(seq: &Seq, contig: &str, tinf: &Tinf, closed: bool, is_meta: bool) -> (Vec<Gene>, f64) {
+    predict_masked(seq, contig, tinf, closed, is_meta, &[])
+}
+
+/// [`predict`] with Prodigal 2.x `-m` masked regions: no gene is built across
+/// (or into) a masked region.
+pub fn predict_masked(
+    seq: &Seq,
+    contig: &str,
+    tinf: &Tinf,
+    closed: bool,
+    is_meta: bool,
+    masks: &[(usize, usize)],
+) -> (Vec<Gene>, f64) {
+    predict_ends(seq, contig, tinf, closed, closed, is_meta, masks)
+}
+
+/// [`predict_masked`] with each end of the sequence open or closed on its own
+/// (`closed_left` / `closed_right`; see [`crate::node::add_nodes_ends`]).
+pub fn predict_ends(
+    seq: &Seq,
+    contig: &str,
+    tinf: &Tinf,
+    closed_left: bool,
+    closed_right: bool,
+    is_meta: bool,
+    masks: &[(usize, usize)],
+) -> (Vec<Gene>, f64) {
     let code = tinf.code();
-    let mut nodes = add_nodes(seq, &code, closed);
+    let mut nodes = add_nodes_ends(seq, &code, closed_left, closed_right, masks);
     sort_nodes(&mut nodes);
     if nodes.is_empty() {
         return (Vec::new(), 0.0);
     }
-    score_nodes(seq, &mut nodes, tinf, closed, is_meta);
+    score_nodes_ends(seq, &mut nodes, tinf, closed_left, closed_right, is_meta);
     record_overlapping_starts(&mut nodes, tinf, true);
     let ipath = dprog(&mut nodes, tinf, true);
     eliminate_bad_genes(&mut nodes, ipath, tinf);
@@ -774,15 +845,26 @@ pub fn predict(seq: &Seq, contig: &str, tinf: &Tinf, closed: bool, is_meta: bool
         let total = cscore + sscore;
         let conf = calculate_confidence(total, tinf.st_wt);
 
-        let start_type = match nodes[sidx].typ {
-            0 => 0u8,
-            1 => 1,
-            2 => 2,
-            _ => 3,
+        // Prodigal `record_gene_data`: an edge start is reported as "Edge".
+        let start_type = if nodes[sidx].edge {
+            3u8
+        } else {
+            match nodes[sidx].typ {
+                0 => 0u8,
+                1 => 1,
+                2 => 2,
+                _ => 3,
+            }
         };
-        let partial_left = begin == 1 && (nodes[if strand == 1 { sidx } else { stopidx }].edge);
-        let partial_right = end == seq.len() as i64
-            && (nodes[if strand == 1 { stopidx } else { sidx }].edge);
+        // Partial flags in Prodigal's genomic orientation (left = lower
+        // coordinate, right = higher), taken straight from the edge nodes.
+        // The old code additionally required begin == 1 / end == len, so edge
+        // genes padded to start at base 2 or 3 (or end at len-1 / len-2 —
+        // two of every three frames) were reported as complete.
+        let (left_node, right_node) = if strand == 1 { (sidx, stopidx) } else { (stopidx, sidx) };
+        let partial_left = nodes[left_node].edge;
+        let partial_right = nodes[right_node].edge;
+        let (rbs_motif, rbs_spacer) = rbs_strings(&nodes[sidx], tinf);
 
         let mut gene = Gene {
             contig: contig.to_string(),
@@ -791,8 +873,8 @@ pub fn predict(seq: &Seq, contig: &str, tinf: &Tinf, closed: bool, is_meta: bool
             end: end as usize,
             strand: if strand == 1 { 1 } else { -1 },
             start_type,
-            rbs_motif: "None".to_string(),
-            rbs_spacer: "None".to_string(),
+            rbs_motif: rbs_motif.to_string(),
+            rbs_spacer: rbs_spacer.to_string(),
             partial_left,
             partial_right,
             score: total,
@@ -815,92 +897,330 @@ pub fn predict(seq: &Seq, contig: &str, tinf: &Tinf, closed: bool, is_meta: bool
     (genes, coding_total)
 }
 
-/// Build a single training sequence from many contigs, separated by
-/// stop-forcing gaps (`TTAATTAATTAA`).
+/// Build a single training sequence from many contigs the way Prodigal does:
+/// each contig followed by a stop-forcing linker (`TTAATTAATTAA`) — between
+/// contigs *and* after the last one (a single contig is used as is).
 pub fn build_training_seq(contigs: &[(String, Seq)]) -> Seq {
     if contigs.len() == 1 {
         return contigs[0].1.clone();
     }
     let mut bytes: Vec<u8> = Vec::new();
-    for (i, (_, s)) in contigs.iter().enumerate() {
-        if i > 0 {
-            bytes.extend_from_slice(TRAIN_GAP);
-        }
-        for &c in &s.fwd {
-            bytes.push(crate::seq::decode_base(c));
-        }
+    for (_, s) in contigs {
+        // Keep ambiguous bases ambiguous (`N`); decoding the 2-bit codes would
+        // silently turn every N into a concrete base in the training set.
+        bytes.extend_from_slice(&s.to_ascii_upper());
+        bytes.extend_from_slice(TRAIN_GAP);
     }
     Seq::from_ascii(&bytes)
 }
 
-/// Choose the genetic code by self-training under each candidate.
-///
-/// Naively picking the highest coding score is biased: codes with fewer stop
-/// codons (4, 15, 25 — two stops each) let ORFs read through what would be a
-/// stop under the standard code (11 / 1 — three stops), which inflates apparent
-/// coding density even on ordinary genomes. To avoid spurious reassignments we
-/// treat the standard code as a baseline and only adopt an alternative code
-/// when it beats the baseline by a clear margin. Genuine alternative-code
-/// genomes clear this bar easily, because using the wrong (standard) code
-/// fragments many real genes at read-through stops and sharply lowers the
-/// score; mere read-through inflation does not.
-pub fn autodetect_code(train_seq: &Seq, candidates: &[u32], closed: bool, is_meta: bool) -> (u32, Tinf) {
-    /// An alternative code must exceed the standard code's score by this factor.
-    const ALT_MARGIN: f64 = 1.10;
+/// [`build_training_seq`] straight from raw FASTA sequences — exactly the
+/// training input Prodigal builds from a multi-record file (assembly gaps
+/// included; Prodigal stores N as a non-stop placeholder).
+pub fn build_training_seq_ascii(records: &[&[u8]]) -> Seq {
+    if records.len() == 1 {
+        return Seq::from_ascii(records[0]);
+    }
+    // Prodigal (`read_seq_training`) and pyrodigal (`GeneFinder.train(*seqs)`)
+    // put the linker after the last record too.
+    let mut bytes: Vec<u8> = Vec::new();
+    for r in records {
+        bytes.extend_from_slice(r);
+        bytes.extend_from_slice(TRAIN_GAP);
+    }
+    Seq::from_ascii(&bytes)
+}
 
-    let mut results: Vec<(u32, Tinf, f64)> = Vec::new();
-    for &tt in candidates {
-        if GeneticCode::new(tt).is_none() {
+/// An alternative genetic code is adopted only if its coding density beats
+/// the baseline and **every** evaluated candidate that keeps a superset of its
+/// stop codons by more than this many density points (0.05 = 5 percentage
+/// points; the same margin CheckM / GTDB-Tk use for table 4 vs 11).
+pub const ALT_CODE_MIN_GAIN: f64 = 0.05;
+/// ...and only if its own coding density exceeds this floor (CheckM / GTDB-Tk).
+pub const ALT_CODE_MIN_DENSITY: f64 = 0.70;
+/// No alternative code is adopted from less unambiguous sequence than this
+/// (Prodigal's own minimum for self-training): the density estimate is too
+/// noisy on a handful of genes. Force the table with `-g` instead.
+pub const ALT_CODE_MIN_TRAIN_BP: usize = 20_000;
+/// A genuine reassignment uses the former stop codon(s) as a *sense* codon
+/// throughout genes. Inside the genes predicted under the alternative table,
+/// the reassigned codons must occur at least this often per 1,000 codons
+/// (real table-4 *Mycoplasma*: ~10; real table-15 phages Agate/Topaz: 11–14).
+/// Fusion artefacts on a standard-code genome sit near 4.
+pub const READTHROUGH_MIN_PER_KCODON: f64 = 5.0;
+/// ...and at most this often: higher rates mean non-coding frames are being
+/// read through, not recoded (table 6 on AT-rich *Mycoplasma*: ~85).
+pub const READTHROUGH_MAX_PER_KCODON: f64 = 50.0;
+/// In a recoded genome the alternative-code genes are the baseline-code gene
+/// fragments **fused in the same frame**. At least this fraction of the bases
+/// in the alternative-code genes must lie inside a baseline-code gene on the
+/// same strand and frame (real recoded genomes: 0.53–0.69; heavy synthetic
+/// recoding ≥ 0.30). Long ORFs that the baseline code calls non-coding —
+/// random or non-coding sequence read under fewer stop codons — score ≤ 0.08.
+pub const ALT_CODE_MIN_SUPPORT: f64 = 0.20;
+
+/// In-gene usage (per 1,000 codons) of the codons that are stops under
+/// `baseline` but sense codons under `alt` — the read-through rate. The last
+/// codon of each gene is excluded; codons with ambiguous bases are skipped.
+pub fn readthrough_per_kcodon(genes: &[Gene], baseline: &GeneticCode, alt: &GeneticCode) -> f64 {
+    let (rt, codons) = readthrough_counts(genes.iter(), baseline, alt);
+    if codons == 0 {
+        0.0
+    } else {
+        1000.0 * rt as f64 / codons as f64
+    }
+}
+
+fn readthrough_counts<'a, I: Iterator<Item = &'a Gene>>(genes: I, baseline: &GeneticCode, alt: &GeneticCode) -> (u64, u64) {
+    let mut codons = 0u64;
+    let mut rt = 0u64;
+    for g in genes {
+        let b = g.nt.as_bytes();
+        let m = b.len() / 3;
+        if m < 2 {
             continue;
         }
-        let tinf = train(train_seq, tt, closed);
-        let (_g, score) = predict(train_seq, "__train__", &tinf, closed, is_meta);
-        results.push((tt, tinf, score));
+        for k in 0..m - 1 {
+            let (c1, a1) = crate::seq::encode_base(b[3 * k]);
+            let (c2, a2) = crate::seq::encode_base(b[3 * k + 1]);
+            let (c3, a3) = crate::seq::encode_base(b[3 * k + 2]);
+            if a1 || a2 || a3 {
+                continue;
+            }
+            codons += 1;
+            if baseline.is_stop(c1, c2, c3) && !alt.is_stop(c1, c2, c3) {
+                rt += 1;
+            }
+        }
     }
-    if results.is_empty() {
+    (rt, codons)
+}
+
+/// Number of bases of a `len`-long sequence covered by at least one gene.
+fn covered_bases(genes: &[Gene], len: usize) -> usize {
+    let mut cov = vec![false; len];
+    for g in genes {
+        let b = g.begin.max(1) - 1;
+        let e = g.end.min(len);
+        for c in cov.iter_mut().take(e).skip(b) {
+            *c = true;
+        }
+    }
+    cov.iter().filter(|&&c| c).count()
+}
+
+/// Fraction of `len` bases covered by at least one gene (coding density).
+pub fn coding_density(genes: &[Gene], len: usize) -> f64 {
+    if len == 0 {
+        return 0.0;
+    }
+    covered_bases(genes, len) as f64 / len as f64
+}
+
+/// Reading frame key of a gene on a `len`-long sequence: 0–2 forward, 3–5 reverse.
+#[inline]
+fn frame_key(g: &Gene, len: usize) -> usize {
+    if g.strand >= 0 {
+        (g.begin - 1) % 3
+    } else {
+        3 + (len - g.end) % 3
+    }
+}
+
+/// Bases of `alt` genes that lie inside a `base` gene on the same strand and
+/// frame, and the total bases of `alt` genes (one sequence of length `len`).
+fn same_frame_support(alt: &[Gene], base: &[Gene], len: usize) -> (u64, u64) {
+    // Baseline genes in one strand/frame never overlap each other.
+    let mut by_frame: [Vec<(usize, usize)>; 6] = Default::default();
+    for g in base {
+        by_frame[frame_key(g, len)].push((g.begin, g.end));
+    }
+    for v in by_frame.iter_mut() {
+        v.sort_unstable();
+    }
+    let (mut sup, mut tot) = (0u64, 0u64);
+    for g in alt {
+        tot += (g.end - g.begin + 1) as u64;
+        let v = &by_frame[frame_key(g, len)];
+        // first interval that could overlap: begin > g.end are excluded
+        let hi = v.partition_point(|&(b, _)| b <= g.end);
+        for &(b, e) in v[..hi].iter().rev() {
+            if e < g.begin {
+                break;
+            }
+            let lo = b.max(g.begin);
+            let up = e.min(g.end);
+            if up >= lo {
+                sup += (up - lo + 1) as u64;
+            }
+        }
+    }
+    (sup, tot)
+}
+
+/// Collapse a candidate list to one representative per *behaviourally
+/// distinct* genetic code, in input order. Tables with the same stop codons and
+/// the same start codons (e.g. 4 and 25, which differ only in what TGA encodes)
+/// produce identical gene calls, so only the first one listed is evaluated.
+pub fn distinct_candidates(candidates: &[u32]) -> Vec<u32> {
+    let mut reps: Vec<(u32, (u64, u64))> = Vec::new();
+    for &tt in candidates {
+        if let Some(c) = GeneticCode::new(tt) {
+            let sig = (c.stop_mask(), c.start_mask());
+            if !reps.iter().any(|(t, s)| *t == tt || *s == sig) {
+                reps.push((tt, sig));
+            }
+        }
+    }
+    reps.into_iter().map(|(t, _)| t).collect()
+}
+
+/// The baseline among `reps`: the first-listed candidate among those that
+/// keep the most stop codons (the most conservative reading). For the standard
+/// lists this is 11; for a list led by 1 (eukaryotes) it is 1.
+fn baseline_code(reps: &[u32]) -> u32 {
+    let stops = |tt: u32| GeneticCode::new(tt).map(|c| c.stop_mask().count_ones()).unwrap_or(0);
+    let most = reps.iter().map(|&t| stops(t)).max().unwrap_or(0);
+    reps.iter().copied().find(|&t| stops(t) == most).unwrap_or(reps[0])
+}
+
+/// Choose the genetic code by self-training under each candidate.
+///
+/// The old criterion — highest *summed coding score*, with a 10% margin over
+/// the standard code — is not comparable across tables: Prodigal's length
+/// factor uses a different stop-probability for every table other than 11, and
+/// the start-codon set changes the score too. Even the real Prodigal scores
+/// phage λ 28% higher under table 1 than table 11 (and 22% higher under 15),
+/// although λ uses the standard code. DYNAMITE therefore picked table 1 for λ.
+///
+/// The decision now follows the established coding-density test (CheckM /
+/// GTDB-Tk), generalised to several candidate codes:
+///
+/// 1. Candidates that make identical gene calls are collapsed
+///    ([`distinct_candidates`]).
+/// 2. The baseline is the first-listed candidate among those keeping the most
+///    stop codons (11 for the standard lists).
+/// 3. Each table is self-trained on `train_seq` and its **coding density**
+///    (fraction of bases inside predicted genes) measured on the evaluation
+///    sequences.
+/// 4. A non-baseline table `T` is eligible only if its density exceeds
+///    [`ALT_CODE_MIN_DENSITY`] *and* beats the baseline and **every** other
+///    candidate whose stop-codon set contains `T`'s by more than
+///    [`ALT_CODE_MIN_GAIN`]. Removing stop codons always lets ORFs read
+///    further, so each removed stop has to earn its own gain: table 1 (same
+///    stops as 11) can never displace 11, and table 6 (only TGA) must beat
+///    both 11 and 15 — which rejects the read-through inflation 6 shows on
+///    genuine table-15 phages.
+/// 5. The codons `T` reassigns must be used inside its genes like sense
+///    codons: between [`READTHROUGH_MIN_PER_KCODON`] and
+///    [`READTHROUGH_MAX_PER_KCODON`] per 1,000 codons
+///    ([`readthrough_per_kcodon`]).
+/// 6. `T`'s genes must be baseline gene fragments fused in frame: at least
+///    [`ALT_CODE_MIN_SUPPORT`] of their bases inside same-strand, same-frame
+///    baseline genes. This rejects non-coding or random sequence, where fewer
+///    stop codons simply create long ORFs the baseline code never called.
+/// 7. The eligible table with the highest density wins (ties: list order);
+///    if none is eligible — or there are fewer than
+///    [`ALT_CODE_MIN_TRAIN_BP`] unambiguous bases — the baseline is kept.
+///
+/// Validated on: phage λ and 14 further table-11 phages, *E. coli* K-12
+/// (→ 11); four *Mycoplasma mycoides* genomes (→ 4); the table-15 phages
+/// Agate and Topaz (→ 15); random and reversed sequence (→ 11).
+pub fn autodetect_code(train_seq: &Seq, candidates: &[u32], closed: bool, is_meta: bool) -> (u32, Tinf) {
+    autodetect_code_on(train_seq, &[train_seq], candidates, closed, is_meta)
+}
+
+/// [`autodetect_code`] that trains on `train_seq` but measures the statistics
+/// on `eval` (DYNAMITE passes the gap-free segments, so an assembly gap can
+/// never count as coding sequence).
+pub fn autodetect_code_on(
+    train_seq: &Seq,
+    eval: &[&Seq],
+    candidates: &[u32],
+    closed: bool,
+    is_meta: bool,
+) -> (u32, Tinf) {
+    let reps = distinct_candidates(candidates);
+    if reps.is_empty() {
         let tinf = train(train_seq, 11, closed);
         return (11, tinf);
     }
+    let baseline = baseline_code(&reps);
+    if reps.len() == 1 {
+        return (reps[0], train(train_seq, reps[0], closed));
+    }
+    let unambiguous: usize = eval.iter().map(|s| s.n.iter().filter(|&&amb| !amb).count()).sum();
+    if unambiguous < ALT_CODE_MIN_TRAIN_BP {
+        return (baseline, train(train_seq, baseline, closed));
+    }
+    let base_code = GeneticCode::new(baseline).expect("validated table");
+    let total_len: usize = eval.iter().map(|s| s.len()).sum();
 
-    // Baseline = the standard code if available (prefer 11, then 1).
-    let baseline_idx = results
-        .iter()
-        .position(|(tt, _, _)| *tt == 11)
-        .or_else(|| results.iter().position(|(tt, _, _)| *tt == 1));
+    struct Eval {
+        tt: u32,
+        tinf: Tinf,
+        density: f64,
+        stops: u64,
+        rt: f64,
+        genes: Vec<Vec<Gene>>,
+    }
+    let mut results: Vec<Eval> = reps
+        .par_iter()
+        .map(|&tt| {
+            let tinf = train(train_seq, tt, closed);
+            let genes: Vec<Vec<Gene>> = eval
+                .iter()
+                .map(|s| predict(s, "__eval__", &tinf, closed, is_meta).0)
+                .collect();
+            let covered: usize = eval.iter().zip(&genes).map(|(s, g)| covered_bases(g, s.len())).sum();
+            let code = GeneticCode::new(tt).expect("validated table");
+            let (rt, codons) = readthrough_counts(genes.iter().flatten(), &base_code, &code);
+            Eval {
+                tt,
+                tinf,
+                density: covered as f64 / total_len.max(1) as f64,
+                stops: code.stop_mask(),
+                rt: if codons == 0 { 0.0 } else { 1000.0 * rt as f64 / codons as f64 },
+                genes,
+            }
+        })
+        .collect();
 
-    // Highest-scoring candidate overall.
-    let mut best_idx = 0usize;
-    for (i, (_, _, s)) in results.iter().enumerate() {
-        if *s > results[best_idx].2 {
-            best_idx = i;
+    let base_idx = results.iter().position(|r| r.tt == baseline).unwrap_or(0);
+    let mut best = base_idx;
+    for i in 0..results.len() {
+        if i == base_idx {
+            continue;
+        }
+        let r = &results[i];
+        if r.density <= ALT_CODE_MIN_DENSITY
+            || r.density - results[base_idx].density <= ALT_CODE_MIN_GAIN
+            || !(READTHROUGH_MIN_PER_KCODON..=READTHROUGH_MAX_PER_KCODON).contains(&r.rt)
+        {
+            continue;
+        }
+        let beats_all_supersets = results.iter().enumerate().all(|(j, u)| {
+            // `u` keeps every stop codon `T` keeps (u ⊇ T): T must clearly beat it.
+            j == i || (u.stops & r.stops) != r.stops || r.density - u.density > ALT_CODE_MIN_GAIN
+        });
+        if !beats_all_supersets {
+            continue;
+        }
+        let (mut sup, mut tot) = (0u64, 0u64);
+        for (k, s) in eval.iter().enumerate() {
+            let (a, b) = same_frame_support(&r.genes[k], &results[base_idx].genes[k], s.len());
+            sup += a;
+            tot += b;
+        }
+        if tot == 0 || (sup as f64 / tot as f64) < ALT_CODE_MIN_SUPPORT {
+            continue;
+        }
+        if best == base_idx || r.density > results[best].density {
+            best = i;
         }
     }
-
-    let chosen = match baseline_idx {
-        None => best_idx, // no standard code among candidates; take the best
-        Some(bi) => {
-            if best_idx == bi {
-                bi
-            } else {
-                let base_score = results[bi].2;
-                let best_score = results[best_idx].2;
-                // Require a clear margin (handle non-positive baselines safely).
-                let threshold = if base_score > 0.0 {
-                    base_score * ALT_MARGIN
-                } else {
-                    base_score // any improvement over a non-positive baseline counts
-                };
-                if best_score > threshold {
-                    best_idx
-                } else {
-                    bi
-                }
-            }
-        }
-    };
-
-    let (tt, tinf, _) = results.swap_remove(chosen);
-    (tt, tinf)
+    let chosen = results.swap_remove(best);
+    (chosen.tt, chosen.tinf)
 }
 
 // ---------------------------------------------------------------------------
@@ -911,7 +1231,7 @@ pub fn autodetect_code(train_seq: &Seq, candidates: &[u32], closed: bool, is_met
 /// and engine tag.
 ///
 /// * `fixed = Some(table)` forces a genetic code; `None` auto-detects among
-///   `candidates` (with DYNAMITE's standard-code bias).
+///   `candidates` (see [`autodetect_code`]).
 /// * Per-contig prediction is parallelised with rayon.
 ///
 /// Returns `(genes, resolved_table)`. This is the shared core behind the
@@ -928,25 +1248,148 @@ pub fn dp_call(
         return (Vec::new(), fixed.unwrap_or(11));
     }
     let train_seq = build_training_seq(contigs);
+    dp_call_trained_on(&train_seq, contigs, fixed, candidates, is_meta, closed, engine)
+}
+
+/// [`dp_call`] with a separate training sequence: the model (and any genetic-
+/// code search) is trained on `train_seq` exactly as Prodigal would — DYNAMITE
+/// passes the input contigs as given, assembly gaps included — while genes are
+/// predicted on `contigs` (the gap-free segments). Inserting a gap therefore
+/// changes nothing away from the gap, just as in Prodigal.
+///
+/// An unsupported `fixed` table yields no genes (it used to panic).
+#[allow(clippy::too_many_arguments)]
+pub fn dp_call_trained_on(
+    train_seq: &Seq,
+    contigs: &[(String, Seq)],
+    fixed: Option<u32>,
+    candidates: &[u32],
+    is_meta: bool,
+    closed: bool,
+    engine: Engine,
+) -> (Vec<Gene>, u32) {
+    dp_call_trained_on_ends(train_seq, contigs, &[], fixed, candidates, is_meta, closed, engine)
+}
+
+/// [`dp_call_trained_on`] with the two ends of each contig open or closed on
+/// their own: `ends[k] = (closed_left, closed_right)` for `contigs[k]`
+/// (missing entries use `closed`). Gap mode 1 closes the ends of the gap-free
+/// segments that border an assembly gap. Training and code detection use
+/// `closed`.
+#[allow(clippy::too_many_arguments)]
+pub fn dp_call_trained_on_ends(
+    train_seq: &Seq,
+    contigs: &[(String, Seq)],
+    ends: &[(bool, bool)],
+    fixed: Option<u32>,
+    candidates: &[u32],
+    is_meta: bool,
+    closed: bool,
+    engine: Engine,
+) -> (Vec<Gene>, u32) {
+    if contigs.is_empty() {
+        return (Vec::new(), fixed.unwrap_or(11));
+    }
+    if let Some(id) = fixed {
+        if GeneticCode::new(id).is_none() {
+            return (Vec::new(), id);
+        }
+    }
     let (code_id, tinf) = match fixed {
-        Some(id) => (id, train(&train_seq, id, closed)),
-        None => autodetect_code(&train_seq, candidates, closed, is_meta),
+        Some(id) => (id, train(train_seq, id, closed)),
+        None => {
+            let eval: Vec<&Seq> = contigs.iter().map(|(_, s)| s).collect();
+            autodetect_code_on(train_seq, &eval, candidates, closed, is_meta)
+        }
     };
+    let code = tinf.code();
     let genes: Vec<Gene> = contigs
         .par_iter()
-        .flat_map_iter(|(id, s)| {
-            let (mut g, _score) = predict(s, id, &tinf, closed, is_meta);
+        .enumerate()
+        .flat_map_iter(|(k, (id, s))| {
+            let (closed_left, closed_right) = ends.get(k).copied().unwrap_or((closed, closed));
+            let (mut g, _score) = predict_ends(s, id, &tinf, closed_left, closed_right, is_meta, &[]);
+            for x in &mut g {
+                x.engine = engine;
+            }
+            // Trim terminal gap codons / infer partial ends (no-op for clean
+            // sequence: Prodigal's edge flags already agree with the codons).
+            crate::finalize::finalize_genes_ends(
+                g,
+                s,
+                &code,
+                closed_left,
+                closed_right,
+                crate::finalize::SeqSource::Genome,
+                crate::finalize::StartRule::Table,
+            )
+            .into_iter()
+        })
+        .collect();
+    (genes, code_id)
+}
+
+/// The Prodigal engines on whole contigs as Prodigal 2.x calls them — the
+/// core of gap mode 2 and `-m` (gap modes 0 and 1 split contigs at gaps
+/// instead, see [`dp_call_trained_on_ends`]). The calls are Prodigal's own,
+/// unchanged.
+///
+/// * `table` — the genetic code (already resolved; an unsupported one yields
+///   no genes);
+/// * `train_masks` — masked regions of `train_seq` (only `-m` masks training);
+/// * `masks[k]` — masked regions of `contigs[k]` (half-open `[begin, end)`,
+///   see [`crate::seq::ambiguous_runs`]); no gene crosses or runs into one.
+#[allow(clippy::too_many_arguments)]
+pub fn dp_call_masked(
+    train_seq: &Seq,
+    train_masks: &[(usize, usize)],
+    contigs: &[(String, Seq)],
+    masks: &[Vec<(usize, usize)>],
+    table: u32,
+    is_meta: bool,
+    closed: bool,
+    engine: Engine,
+) -> Vec<Gene> {
+    if GeneticCode::new(table).is_none() || contigs.is_empty() {
+        return Vec::new();
+    }
+    let tinf = train_masked(train_seq, table, closed, train_masks);
+    contigs
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(k, (id, s))| {
+            let m: &[(usize, usize)] = masks.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
+            let (mut g, _score) = predict_masked(s, id, &tinf, closed, is_meta, m);
             for x in &mut g {
                 x.engine = engine;
             }
             g.into_iter()
         })
-        .collect();
-    (genes, code_id)
+        .collect()
 }
 
 /// **Prodigal** preset — bacteria and archaea: a single self-trained genome
 /// under the standard bacterial/archaeal code 11 (override with `fixed`).
 pub fn call(contigs: &[(String, Seq)], fixed: Option<u32>, closed: bool) -> (Vec<Gene>, u32) {
     dp_call(contigs, Some(fixed.unwrap_or(11)), &[11], false, closed, Engine::Prodigal)
+}
+
+/// **Prodigal** preset with genetic-code auto-detection among `candidates`
+/// (used for `-e prodigal -g auto`).
+pub fn call_auto(contigs: &[(String, Seq)], candidates: &[u32], closed: bool) -> (Vec<Gene>, u32) {
+    dp_call(contigs, None, candidates, false, closed, Engine::Prodigal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_record_training_set_ends_with_a_linker() {
+        // Prodigal / pyrodigal: rec1 + linker + rec2 + linker.
+        let t = build_training_seq_ascii(&[b"ACGTAC".as_slice(), b"GGG".as_slice()]);
+        assert_eq!(t.to_ascii_upper(), b"ACGTACTTAATTAATTAAGGGTTAATTAATTAA".to_vec());
+        let one = build_training_seq_ascii(&[b"ACGTAC".as_slice()]);
+        assert_eq!(one.to_ascii_upper(), b"ACGTAC".to_vec());
+    }
 }

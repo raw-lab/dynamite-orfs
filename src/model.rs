@@ -20,7 +20,7 @@ pub enum EngineKind {
     GeneMark,
     /// AUGUSTUS-style eukaryotic caller (single-exon).
     Augustus,
-    /// FragGeneScan-style read caller with frameshift handling.
+    /// FragGeneScan read caller (vendored FragGeneScanRs HMM, `complete` model).
     FragGeneScan,
 }
 

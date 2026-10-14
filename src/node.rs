@@ -171,8 +171,25 @@ fn base_at(seq: &[u8], i: i64) -> Option<u8> {
     seq.get(i as usize).copied()
 }
 
+/// `true` if any base of the codon at `i` is ambiguous (N / IUPAC) or the
+/// codon runs off the sequence. Such a codon is never a start or a stop.
 #[inline]
-fn is_stop_at(seq: &[u8], i: i64, code: &GeneticCode) -> bool {
+fn codon_amb(amb: &[bool], i: i64) -> bool {
+    if i < 0 {
+        return true;
+    }
+    let u = i as usize;
+    match (amb.get(u), amb.get(u + 1), amb.get(u + 2)) {
+        (Some(&a), Some(&b), Some(&c)) => a || b || c,
+        _ => true,
+    }
+}
+
+#[inline]
+fn is_stop_at(seq: &[u8], amb: &[bool], i: i64, code: &GeneticCode) -> bool {
+    if codon_amb(amb, i) {
+        return false;
+    }
     match (base_at(seq, i), base_at(seq, i + 1), base_at(seq, i + 2)) {
         (Some(a), Some(b), Some(c)) => code.is_stop(a, b, c),
         _ => false,
@@ -180,7 +197,10 @@ fn is_stop_at(seq: &[u8], i: i64, code: &GeneticCode) -> bool {
 }
 
 #[inline]
-fn is_start_at(seq: &[u8], i: i64, code: &GeneticCode) -> bool {
+fn is_start_at(seq: &[u8], amb: &[bool], i: i64, code: &GeneticCode) -> bool {
+    if codon_amb(amb, i) {
+        return false;
+    }
     match (base_at(seq, i), base_at(seq, i + 1), base_at(seq, i + 2)) {
         (Some(a), Some(b), Some(c)) => code.is_start(a, b, c),
         _ => false,
@@ -216,9 +236,53 @@ fn dmax(a: f64, b: f64) -> f64 {
 
 /// Enumerate every start and stop node on both strands (Prodigal `add_nodes`).
 pub fn add_nodes(seq: &Seq, code: &GeneticCode, closed: bool) -> Vec<Node> {
+    add_nodes_masked(seq, code, closed, &[])
+}
+
+/// `true` if the half-open interval `[x, y)` overlaps a masked region —
+/// pyrodigal's `Mask.intersects`, Prodigal's `cross_mask`. `masks` are sorted,
+/// non-overlapping half-open `[begin, end)` intervals.
+#[inline]
+fn crosses_mask(masks: &[(usize, usize)], x: i64, y: i64) -> bool {
+    if masks.is_empty() || y <= 0 {
+        return false;
+    }
+    let x = x.max(0) as usize;
+    let k = masks.partition_point(|&(_, e)| e <= x);
+    k < masks.len() && (masks[k].0 as i64) < y
+}
+
+/// [`add_nodes`] with Prodigal 2.x's `-m` masking: no gene (start node) is
+/// created whose span from start to stop crosses a masked region, so no gene
+/// can be built across — or run into — a masked run of ambiguous bases.
+/// `masks` are sorted half-open `[begin, end)` intervals
+/// (see [`crate::seq::ambiguous_runs`]); with none this is exactly
+/// [`add_nodes`].
+pub fn add_nodes_masked(seq: &Seq, code: &GeneticCode, closed: bool, masks: &[(usize, usize)]) -> Vec<Node> {
+    add_nodes_ends(seq, code, closed, closed, masks)
+}
+
+/// [`add_nodes_masked`] with each end of the sequence open or closed on its
+/// own: `closed_left` / `closed_right` forbid genes running off the low /
+/// high-coordinate end (Prodigal's `closed` closes both). Used for gap
+/// mode 1, where a segment's ends at an assembly gap are closed while the
+/// contig's own ends follow `--closed`.
+pub fn add_nodes_ends(
+    seq: &Seq,
+    code: &GeneticCode,
+    closed_left: bool,
+    closed_right: bool,
+    masks: &[(usize, usize)],
+) -> Vec<Node> {
     let slen = seq.len() as i64;
     let fwd = &seq.fwd;
     let rev = &seq.rev;
+    // Ambiguity masks: a codon touching an N / IUPAC base is never a start or
+    // a stop (previously N was read as A, so e.g. `TNN` became a `TAA` stop
+    // and genes could end inside assembly gaps).
+    let famb: &[bool] = &seq.n;
+    let ramb_v = seq.n_rev();
+    let ramb: &[bool] = &ramb_v;
     let mut nodes: Vec<Node> = Vec::new();
     if slen < 3 {
         return nodes;
@@ -230,12 +294,13 @@ pub fn add_nodes(seq: &Seq, code: &GeneticCode, closed: bool) -> Vec<Node> {
     let slmod = (slen % 3) as usize;
 
     // ---- Forward strand ----
+    // (3' ends run off the right end; edge starts sit at the left end.)
     for i in 0..3i64 {
         let f = ((i + slmod as i64) % 3) as usize;
         last[f] = slen + i;
         saw_start[(i % 3) as usize] = false;
         min_dist[(i % 3) as usize] = MIN_EDGE_GENE;
-        if !closed {
+        if !closed_right {
             while last[f] + 2 > slen - 1 {
                 last[f] -= 3;
             }
@@ -244,10 +309,10 @@ pub fn add_nodes(seq: &Seq, code: &GeneticCode, closed: bool) -> Vec<Node> {
     let mut i = slen - 3;
     while i >= 0 {
         let fr = (i % 3) as usize;
-        if is_stop_at(fwd, i, code) {
+        if is_stop_at(fwd, famb, i, code) {
             if saw_start[fr] {
                 let mut n = Node::default();
-                if !is_stop_at(fwd, last[fr], code) {
+                if !is_stop_at(fwd, famb, last[fr], code) {
                     n.edge = true;
                 }
                 n.ndx = last[fr];
@@ -266,14 +331,18 @@ pub fn add_nodes(seq: &Seq, code: &GeneticCode, closed: bool) -> Vec<Node> {
             i -= 1;
             continue;
         }
+        if crosses_mask(masks, i, last[fr]) {
+            i -= 1;
+            continue;
+        }
         let long_enough = (last[fr] - i + 3) >= min_dist[fr];
-        if is_start_at(fwd, i, code) && is_atg_at(fwd, i) && long_enough {
+        if is_start_at(fwd, famb, i, code) && is_atg_at(fwd, i) && long_enough {
             push_start(&mut nodes, i, ATG, last[fr], 1, &mut saw_start, fr);
-        } else if is_start_at(fwd, i, code) && is_gtg_at(fwd, i) && long_enough {
+        } else if is_start_at(fwd, famb, i, code) && is_gtg_at(fwd, i) && long_enough {
             push_start(&mut nodes, i, GTG, last[fr], 1, &mut saw_start, fr);
-        } else if is_start_at(fwd, i, code) && is_ttg_at(fwd, i) && long_enough {
+        } else if is_start_at(fwd, famb, i, code) && is_ttg_at(fwd, i) && long_enough {
             push_start(&mut nodes, i, TTG, last[fr], 1, &mut saw_start, fr);
-        } else if i <= 2 && !closed && (last[fr] - i) > MIN_EDGE_GENE {
+        } else if i <= 2 && !closed_left && (last[fr] - i) > MIN_EDGE_GENE {
             let mut n = Node::default();
             n.ndx = i;
             n.typ = ATG;
@@ -288,7 +357,7 @@ pub fn add_nodes(seq: &Seq, code: &GeneticCode, closed: bool) -> Vec<Node> {
     for k in 0..3usize {
         if saw_start[k] {
             let mut n = Node::default();
-            if !is_stop_at(fwd, last[k], code) {
+            if !is_stop_at(fwd, famb, last[k], code) {
                 n.edge = true;
             }
             n.ndx = last[k];
@@ -300,12 +369,13 @@ pub fn add_nodes(seq: &Seq, code: &GeneticCode, closed: bool) -> Vec<Node> {
     }
 
     // ---- Reverse strand ----
+    // (3' ends run off the left end; edge starts sit at the right end.)
     for i in 0..3i64 {
         let f = ((i + slmod as i64) % 3) as usize;
         last[f] = slen + i;
         saw_start[(i % 3) as usize] = false;
         min_dist[(i % 3) as usize] = MIN_EDGE_GENE;
-        if !closed {
+        if !closed_left {
             while last[f] + 2 > slen - 1 {
                 last[f] -= 3;
             }
@@ -314,10 +384,10 @@ pub fn add_nodes(seq: &Seq, code: &GeneticCode, closed: bool) -> Vec<Node> {
     let mut i = slen - 3;
     while i >= 0 {
         let fr = (i % 3) as usize;
-        if is_stop_at(rev, i, code) {
+        if is_stop_at(rev, ramb, i, code) {
             if saw_start[fr] {
                 let mut n = Node::default();
-                if !is_stop_at(rev, last[fr], code) {
+                if !is_stop_at(rev, ramb, last[fr], code) {
                     n.edge = true;
                 }
                 n.ndx = slen - last[fr] - 1;
@@ -336,16 +406,20 @@ pub fn add_nodes(seq: &Seq, code: &GeneticCode, closed: bool) -> Vec<Node> {
             i -= 1;
             continue;
         }
+        if crosses_mask(masks, slen - last[fr] - 1, slen - i - 1) {
+            i -= 1;
+            continue;
+        }
         let long_enough = (last[fr] - i + 3) >= min_dist[fr];
         let nd = slen - i - 1;
         let sv = slen - last[fr] - 1;
-        if is_start_at(rev, i, code) && is_atg_at(rev, i) && long_enough {
+        if is_start_at(rev, ramb, i, code) && is_atg_at(rev, i) && long_enough {
             push_start(&mut nodes, nd, ATG, sv, -1, &mut saw_start, fr);
-        } else if is_start_at(rev, i, code) && is_gtg_at(rev, i) && long_enough {
+        } else if is_start_at(rev, ramb, i, code) && is_gtg_at(rev, i) && long_enough {
             push_start(&mut nodes, nd, GTG, sv, -1, &mut saw_start, fr);
-        } else if is_start_at(rev, i, code) && is_ttg_at(rev, i) && long_enough {
+        } else if is_start_at(rev, ramb, i, code) && is_ttg_at(rev, i) && long_enough {
             push_start(&mut nodes, nd, TTG, sv, -1, &mut saw_start, fr);
-        } else if i <= 2 && !closed && (last[fr] - i) > MIN_EDGE_GENE {
+        } else if i <= 2 && !closed_right && (last[fr] - i) > MIN_EDGE_GENE {
             let mut n = Node::default();
             n.ndx = nd;
             n.typ = ATG;
@@ -360,7 +434,7 @@ pub fn add_nodes(seq: &Seq, code: &GeneticCode, closed: bool) -> Vec<Node> {
     for k in 0..3usize {
         if saw_start[k] {
             let mut n = Node::default();
-            if !is_stop_at(rev, last[k], code) {
+            if !is_stop_at(rev, ramb, last[k], code) {
                 n.edge = true;
             }
             n.ndx = slen - last[k] - 1;
@@ -410,23 +484,30 @@ pub fn record_gc_bias(gc: &[u8], nodes: &mut [Node], tinf: &mut Tinf) {
     }
     let mut ctr = [[0i64; 3]; 3];
     let mut last = [0i64; 3];
+    // Prodigal stores -1 for the trailing bases of the GC frame plot.
+    let gcv = |p: i64| -> i64 {
+        match gc.get(p as usize) {
+            Some(&v) if v != crate::gcframe::GC_FRAME_UNSET => v as i64,
+            _ => -1,
+        }
+    };
 
     // Forward pass (high index to low).
     for idx in (0..nn).rev() {
         let fr = (nodes[idx].ndx % 3) as usize;
-        let frmod = 3 - fr;
+        let frmod = 3 - fr as i64;
         if nodes[idx].strand == 1 && nodes[idx].typ == STOP {
             for j in 0..3 {
                 ctr[fr][j] = 0;
             }
             last[fr] = nodes[idx].ndx;
-            let g = gc[nodes[idx].ndx as usize] as usize;
-            ctr[fr][(g + frmod) % 3] = 1;
+            let g = gcv(nodes[idx].ndx);
+            ctr[fr][((g + frmod).rem_euclid(3)) as usize] = 1;
         } else if nodes[idx].strand == 1 {
             let mut j = last[fr] - 3;
             while j >= nodes[idx].ndx {
-                let g = gc[j as usize] as usize;
-                ctr[fr][(g + frmod) % 3] += 1;
+                let g = gcv(j);
+                ctr[fr][((g + frmod).rem_euclid(3)) as usize] += 1;
                 j -= 3;
             }
             let mfr = max_fr(ctr[fr][0], ctr[fr][1], ctr[fr][2]) as usize;
@@ -448,13 +529,13 @@ pub fn record_gc_bias(gc: &[u8], nodes: &mut [Node], tinf: &mut Tinf) {
                 ctr[fr][j] = 0;
             }
             last[fr] = nodes[idx].ndx;
-            let g = gc[nodes[idx].ndx as usize] as i64;
-            ctr[fr][(((3 - g) + frmod as i64) % 3) as usize] = 1;
+            let g = gcv(nodes[idx].ndx);
+            ctr[fr][(((3 - g) + frmod as i64).rem_euclid(3)) as usize] = 1;
         } else if nodes[idx].strand == -1 {
             let mut j = last[fr] + 3;
             while j <= nodes[idx].ndx {
-                let g = gc[j as usize] as i64;
-                ctr[fr][(((3 - g) + frmod as i64) % 3) as usize] += 1;
+                let g = gcv(j);
+                ctr[fr][(((3 - g) + frmod as i64).rem_euclid(3)) as usize] += 1;
                 j += 3;
             }
             let mfr = max_fr(ctr[fr][0], ctr[fr][1], ctr[fr][2]) as usize;
@@ -1138,11 +1219,27 @@ fn score_upstream_composition(seq: &[u8], node: &mut Node, tinf: &Tinf) {
 
 /// Score every start node: coding + start signal (`score_nodes`).
 pub fn score_nodes(seq: &Seq, nodes: &mut [Node], tinf: &Tinf, closed: bool, is_meta: bool) {
+    score_nodes_ends(seq, nodes, tinf, closed, closed, is_meta)
+}
+
+/// [`score_nodes`] with each sequence end open or closed on its own (see
+/// [`add_nodes_ends`]).
+pub fn score_nodes_ends(
+    seq: &Seq,
+    nodes: &mut [Node],
+    tinf: &Tinf,
+    closed_left: bool,
+    closed_right: bool,
+    is_meta: bool,
+) {
     let slen = seq.len() as i64;
     let fwd = &seq.fwd;
     let rev = &seq.rev;
     let nn = nodes.len();
     let code = tinf.code();
+    let famb: &[bool] = &seq.n;
+    let ramb_v = seq.n_rev();
+    let ramb: &[bool] = &ramb_v;
 
     calc_orf_gc(seq, nodes);
     raw_coding_score(seq, nodes, tinf);
@@ -1156,8 +1253,8 @@ pub fn score_nodes(seq: &Seq, nodes: &mut [Node], tinf: &Tinf, closed: bool, is_
         if nodes[i].edge {
             edge_gene += 1;
         }
-        let runs_off = (nodes[i].strand == 1 && !is_stop_at(fwd, nodes[i].stop_val, &code))
-            || (nodes[i].strand == -1 && !is_stop_at(rev, slen - 1 - nodes[i].stop_val, &code));
+        let runs_off = (nodes[i].strand == 1 && !is_stop_at(fwd, famb, nodes[i].stop_val, &code))
+            || (nodes[i].strand == -1 && !is_stop_at(rev, ramb, slen - 1 - nodes[i].stop_val, &code));
         if runs_off {
             edge_gene += 1;
         }
@@ -1178,9 +1275,9 @@ pub fn score_nodes(seq: &Seq, nodes: &mut [Node], tinf: &Tinf, closed: bool, is_
                 score_upstream_composition(rev, &mut nodes[i], tinf);
             }
 
-            if !closed && nodes[i].ndx <= 2 && nodes[i].strand == 1 {
+            if !closed_left && nodes[i].ndx <= 2 && nodes[i].strand == 1 {
                 nodes[i].uscore += EDGE_UPS * tinf.st_wt;
-            } else if !closed && nodes[i].ndx >= slen - 3 && nodes[i].strand == -1 {
+            } else if !closed_right && nodes[i].ndx >= slen - 3 && nodes[i].strand == -1 {
                 nodes[i].uscore += EDGE_UPS * tinf.st_wt;
             } else if i < 500 && nodes[i].strand == 1 {
                 for j in (0..i).rev() {
@@ -1200,10 +1297,9 @@ pub fn score_nodes(seq: &Seq, nodes: &mut [Node], tinf: &Tinf, closed: bool, is_
         }
 
         // Convert near-edge starts to edge genes when ends are open.
-        if ((nodes[i].ndx <= 2 && nodes[i].strand == 1)
-            || (nodes[i].ndx >= slen - 3 && nodes[i].strand == -1))
+        if ((nodes[i].ndx <= 2 && nodes[i].strand == 1 && !closed_left)
+            || (nodes[i].ndx >= slen - 3 && nodes[i].strand == -1 && !closed_right))
             && !nodes[i].edge
-            && !closed
         {
             edge_gene += 1;
             nodes[i].edge = true;
@@ -1335,7 +1431,40 @@ pub fn determine_sd_usage(tinf: &mut Tinf) {
     }
 }
 
-/// Convenience: the per-base most-GC frame plot used by `record_gc_bias`.
+/// Convenience: the per-base most-GC frame plot (trailing bases reported as 0;
+/// the Prodigal trainer itself uses [`crate::gcframe::most_gc_frame_prodigal`]).
 pub fn gc_frame_plot(seq: &Seq) -> Vec<u8> {
     most_gc_frame(&seq.fwd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_crossing_is_half_open() {
+        let masks = [(10usize, 20usize), (40, 50)];
+        assert!(!crosses_mask(&masks, 0, 10)); // ends right before the mask
+        assert!(crosses_mask(&masks, 0, 11));
+        assert!(crosses_mask(&masks, 19, 30));
+        assert!(!crosses_mask(&masks, 20, 40)); // between the masks
+        assert!(crosses_mask(&masks, 20, 41));
+        assert!(crosses_mask(&masks, 0, 100)); // spans both
+        assert!(!crosses_mask(&[], 0, 100));
+    }
+
+    #[test]
+    fn masked_and_one_sided_nodes_reduce_to_add_nodes() {
+        let s = Seq::from_ascii(b"ATGAAACCCGGGTTTAAATGACCCATGGGTTTCCCAAATAGGCATGCATGCATGTAAATGCCC");
+        let code = GeneticCode::new(11).unwrap();
+        for closed in [false, true] {
+            let a = add_nodes(&s, &code, closed);
+            let b = add_nodes_ends(&s, &code, closed, closed, &[]);
+            assert_eq!(a.len(), b.len());
+            assert!(a.iter().zip(&b).all(|(x, y)| x.ndx == y.ndx && x.stop_val == y.stop_val && x.edge == y.edge));
+        }
+        // a mask over the whole sequence leaves no start node
+        let all = add_nodes_masked(&s, &code, false, &[(0, s.len())]);
+        assert!(all.iter().all(|n| n.typ == STOP));
+    }
 }

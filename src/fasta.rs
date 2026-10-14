@@ -23,9 +23,18 @@ pub fn read_fasta<P: AsRef<Path>>(path: P) -> Result<Vec<Record>> {
         .with_context(|| format!("could not open input file {}", path.display()))?;
     let mut reader = BufReader::new(file);
 
-    // Peek the first two bytes to detect gzip regardless of extension.
+    // Peek the first two bytes to detect gzip regardless of extension. A
+    // single `read` may legally return fewer bytes than asked for (pipes,
+    // FIFOs), so keep reading until two bytes or EOF.
     let mut magic = [0u8; 2];
-    let n = reader.read(&mut magic)?;
+    let mut n = 0usize;
+    while n < 2 {
+        let got = reader.read(&mut magic[n..])?;
+        if got == 0 {
+            break;
+        }
+        n += got;
+    }
     let is_gz = n == 2 && magic[0] == 0x1f && magic[1] == 0x8b;
 
     // Reconstruct a reader over the full stream (we consumed the magic bytes).
@@ -47,9 +56,10 @@ fn parse<R: BufRead>(reader: R) -> Result<Vec<Record>> {
     let mut seq: Vec<u8> = Vec::new();
     let mut have = false;
 
-    for line in reader.lines() {
-        let line = line?;
-        let bytes = line.as_bytes();
+    // Read raw byte lines: a header with a non-UTF-8 byte (e.g. Latin-1
+    // strain names) used to abort the whole read with "invalid UTF-8".
+    for line in reader.split(b'\n') {
+        let bytes = line?;
         if bytes.first() == Some(&b'>') {
             if have {
                 records.push(Record {
@@ -58,7 +68,8 @@ fn parse<R: BufRead>(reader: R) -> Result<Vec<Record>> {
                     seq: std::mem::take(&mut seq),
                 });
             }
-            let header = line[1..].trim_end();
+            let text = String::from_utf8_lossy(&bytes[1..]);
+            let header = text.trim_end();
             desc = header.to_string();
             id = header
                 .split_whitespace()
@@ -67,7 +78,7 @@ fn parse<R: BufRead>(reader: R) -> Result<Vec<Record>> {
                 .to_string();
             have = true;
         } else if have {
-            for &b in bytes {
+            for &b in &bytes {
                 if !b.is_ascii_whitespace() {
                     seq.push(b);
                 }
@@ -96,5 +107,14 @@ mod tests {
         assert_eq!(recs[0].seq, b"ACGTACGT");
         assert_eq!(recs[1].id, "seq2");
         assert_eq!(recs[1].seq, b"TTTT");
+    }
+
+    #[test]
+    fn non_utf8_header_and_crlf() {
+        let data: &[u8] = b">s1 souche \xe9t\xe9\r\nACGT\r\nAC\n";
+        let recs = parse(BufReader::new(Cursor::new(data))).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].id, "s1");
+        assert_eq!(recs[0].seq, b"ACGTAC");
     }
 }

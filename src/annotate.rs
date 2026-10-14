@@ -15,7 +15,7 @@
 use crate::fasta::Record;
 use crate::gencode::GeneticCode;
 use crate::seq::Seq;
-use crate::{rna, run_records, RunConfig};
+use crate::{rna, run_records_with, RunConfig, RunOptions};
 use anyhow::Result;
 use std::fmt::Write as _;
 
@@ -65,9 +65,67 @@ struct Feat {
     product: String,
     nt: String,
     aa: String, // CDS only
+    /// Incomplete at the lower-coordinate end (genomic, Prodigal convention).
     partial_left: bool,
+    /// Incomplete at the higher-coordinate end.
     partial_right: bool,
     trans_table: u32,
+}
+
+impl Feat {
+    /// 5' end incomplete (strand-relative).
+    fn partial_5p(&self) -> bool {
+        if self.strand >= 0 {
+            self.partial_left
+        } else {
+            self.partial_right
+        }
+    }
+    /// 3' end incomplete (strand-relative).
+    fn partial_3p(&self) -> bool {
+        if self.strand >= 0 {
+            self.partial_right
+        } else {
+            self.partial_left
+        }
+    }
+    /// INSDC location with `<` / `>` on the incomplete genomic ends.
+    fn location(&self) -> String {
+        let lb = if self.partial_left { "<" } else { "" };
+        let rb = if self.partial_right { ">" } else { "" };
+        if self.strand >= 0 {
+            format!("{lb}{}..{rb}{}", self.begin, self.end)
+        } else {
+            format!("complement({lb}{}..{rb}{})", self.begin, self.end)
+        }
+    }
+}
+
+/// Three-letter amino-acid name for a tRNA product (`tRNA-Ala`, ...).
+fn aa_three_letter(aa: char) -> Option<&'static str> {
+    Some(match aa.to_ascii_uppercase() {
+        'A' => "Ala",
+        'R' => "Arg",
+        'N' => "Asn",
+        'D' => "Asp",
+        'C' => "Cys",
+        'Q' => "Gln",
+        'E' => "Glu",
+        'G' => "Gly",
+        'H' => "His",
+        'I' => "Ile",
+        'L' => "Leu",
+        'K' => "Lys",
+        'M' => "Met",
+        'F' => "Phe",
+        'P' => "Pro",
+        'S' => "Ser",
+        'T' => "Thr",
+        'W' => "Trp",
+        'Y' => "Tyr",
+        'V' => "Val",
+        _ => return None,
+    })
 }
 
 fn complement(b: u8) -> u8 {
@@ -115,10 +173,16 @@ fn wrap(out: &mut String, seq: &str, width: usize) {
 /// Map an `rna::RnaFeature` to a (ftype, product) pair.
 fn rna_product(kind: &str, note: &str) -> (String, String) {
     if kind.starts_with("tRNA") {
-        let p = if note.is_empty() {
-            "tRNA".to_string()
-        } else {
-            note.to_string()
+        // Product is the NCBI-style name (`tRNA-Cys`); the raw scanner note
+        // (`anticodon=GCA;aa=C;model=heuristic`) is not a product name and
+        // used to leak into the .tbl / .gff product fields.
+        let aa = note
+            .split(';')
+            .find_map(|kv| kv.strip_prefix("aa="))
+            .and_then(|v| v.chars().next());
+        let p = match aa.and_then(aa_three_letter) {
+            Some(name) => format!("tRNA-{name}"),
+            None => "tRNA".to_string(),
         };
         ("tRNA".to_string(), p)
     } else if kind.starts_with("rRNA") {
@@ -139,10 +203,22 @@ fn rna_product(kind: &str, note: &str) -> (String, String) {
 
 /// Build the full annotation bundle from input records.
 pub fn annotate(records: &[Record], cfg: &AnnotateConfig) -> Result<AnnotationBundle> {
+    annotate_with(records, cfg, &RunOptions::default())
+}
+
+/// [`annotate`] with extra gene-calling [`RunOptions`] (e.g. Prodigal's gap
+/// handling, [`crate::GapMode`]).
+pub fn annotate_with(records: &[Record], cfg: &AnnotateConfig, opts: &RunOptions) -> Result<AnnotationBundle> {
     // 1) CDS calling.
-    let out = run_records(records, &cfg.run)?;
+    let out = run_records_with(records, &cfg.run, opts)?;
     let engine_label = out.engine.label().to_string();
-    let cds_table = out.genes.first().map(|g| g.trans_table).unwrap_or(11);
+    // The genetic code actually used (after any auto-detection).
+    let cds_table = out.trans_table;
+    // tRNA anticodons are read with the same code unless one was forced.
+    let rna_code = match cfg.run.code {
+        crate::model::CodeChoice::Fixed(_) => cfg.rna_code,
+        _ => cds_table,
+    };
 
     // contig ascii (uppercased, original order) keyed for sequence emission.
     let contigs: Vec<(String, String, Vec<u8>)> = records
@@ -156,7 +232,7 @@ pub fn annotate(records: &[Record], cfg: &AnnotateConfig) -> Result<AnnotationBu
     // 2) RNA detection (optional).
     let mut rna_by_contig: Vec<(String, Vec<rna::RnaFeature>)> = Vec::new();
     if cfg.detect_rna {
-        let code = GeneticCode::new(cfg.rna_code).unwrap_or_else(|| GeneticCode::new(11).unwrap());
+        let code = GeneticCode::new(rna_code).unwrap_or_else(|| GeneticCode::new(11).unwrap());
         for (id, _desc, up) in &contigs {
             let s = Seq::from_ascii(up);
             let feats = rna::find_all(&s, &code);
@@ -316,8 +392,8 @@ pub fn annotate(records: &[Record], cfg: &AnnotateConfig) -> Result<AnnotationBu
             } else {
                 (f.end, f.begin)
             };
-            let p5 = if f.partial_left { "<" } else { "" };
-            let p3 = if f.partial_right { ">" } else { "" };
+            let p5 = if f.partial_5p() { "<" } else { "" };
+            let p3 = if f.partial_3p() { ">" } else { "" };
             let _ = writeln!(tbl, "{p5}{c5}\t{p3}{c3}\t{}", f.ftype);
             let _ = writeln!(tbl, "\t\t\tlocus_tag\t{}", f.locus_tag);
             let _ = writeln!(tbl, "\t\t\tproduct\t{}", f.product);
@@ -332,11 +408,7 @@ pub fn annotate(records: &[Record], cfg: &AnnotateConfig) -> Result<AnnotationBu
     let mut gbk = String::new();
     for (id, _d, up) in &contigs {
         let len = up.len();
-        let _ = writeln!(
-            gbk,
-            "LOCUS       {:<16}{} bp    DNA     linear       01-JAN-2025",
-            id, len
-        );
+        let _ = writeln!(gbk, "{}", crate::gene::locus_line(id, len));
         let _ = writeln!(
             gbk,
             "DEFINITION  {}, whole genome shotgun sequence.",
@@ -355,11 +427,7 @@ pub fn annotate(records: &[Record], cfg: &AnnotateConfig) -> Result<AnnotationBu
         }
         let _ = writeln!(gbk, "                     /mol_type=\"genomic DNA\"");
         for f in feats.iter().filter(|f| &f.contig == id) {
-            let loc = if f.strand >= 0 {
-                format!("{}..{}", f.begin, f.end)
-            } else {
-                format!("complement({}..{})", f.begin, f.end)
-            };
+            let loc = f.location();
             let _ = writeln!(gbk, "     {:<16}{}", f.ftype, loc);
             let _ = writeln!(gbk, "                     /locus_tag=\"{}\"", f.locus_tag);
             let _ = writeln!(gbk, "                     /product=\"{}\"", f.product);
@@ -456,8 +524,8 @@ pub fn annotate(records: &[Record], cfg: &AnnotateConfig) -> Result<AnnotationBu
             f.contig,
             f.begin,
             f.end,
-            if f.partial_left { "5'" } else { "" },
-            if f.partial_right { "3'" } else { "" }
+            if f.partial_5p() { "5'" } else { "" },
+            if f.partial_3p() { "3'" } else { "" }
         );
     }
     let _ = writeln!(err, "CDS_WITH_INTERNAL_STOP: {}", internal_stop.len());
@@ -469,6 +537,11 @@ pub fn annotate(records: &[Record], cfg: &AnnotateConfig) -> Result<AnnotationBu
     let mut log = String::new();
     log.push_str("DYNAMITE annotate\n");
     let _ = writeln!(log, "engine: {}", engine_label);
+    let _ = writeln!(log, "genetic code: {}", cds_table);
+    let kind = cfg.run.engine.unwrap_or(crate::model::config_for(cfg.run.mode).engine);
+    if crate::engine_supports_gap_mode(kind) {
+        let _ = writeln!(log, "gap mode: {}", opts.gap_mode.label());
+    }
     let _ = writeln!(log, "locus_tag prefix: {}", cfg.locus_prefix);
     let _ = writeln!(log, "organism: {}", org_full);
     let _ = writeln!(log, "detect_rna: {}", cfg.detect_rna);

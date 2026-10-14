@@ -20,6 +20,7 @@
   (GPL-3.0-or-later) re-implementations. The old `src/fgs/mod.rs` note calling FragGeneScanRs
   "compatible with DYNAMITE's licence" is gone — it dated from when the crate was GPL.
 
+
 `cargo test`: 49 unit, 3 licence and 15 regression tests.
 
 ## 1.1.0 — Prodigal gap options + bug fixes

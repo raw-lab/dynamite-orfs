@@ -17,7 +17,7 @@
 ### an ORF / gene caller for **all domains of life**
 
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org/)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+![License](https://img.shields.io/badge/license-CC_BY--NC_4.0-blue)
 [![Version](https://img.shields.io/badge/version-1.1.0-success)](https://github.com/raw-lab/dynamite)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey)](https://github.com/raw-lab/dynamite)
 [![Single binary](https://img.shields.io/badge/single%20binary-~8%20MB-brightgreen)](https://github.com/raw-lab/dynamite)

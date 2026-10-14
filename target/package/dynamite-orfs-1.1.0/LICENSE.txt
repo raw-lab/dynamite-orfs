@@ -1,0 +1,32 @@
+Creative Commons Attribution-NonCommercial (CC BY-NC 4.0)
+
+Academic and Non-Commercial Use License
+
+Copyright (c) 2026 Richard Allen White III
+
+Permission is hereby granted, free of charge, to any person or organization obtaining a copy
+of this software and associated documentation files (the "Software"), to use, copy, modify,
+and distribute the Software for academic, research, and non-commercial purposes, subject to
+the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all copies
+    or substantial portions of the Software.
+
+
+    The Software may not be used, in whole or in part, for commercial purposes without
+    prior written permission from the copyright holder.
+
+
+    Commercial purposes include, but are not limited to, use in a product or service that
+    is sold, licensed, or generates revenue.
+
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+    INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+    PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+    FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+    OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+
+For commercial licensing inquiries, please contact: Richard Allen White III, rwhit101@charlotte.edu

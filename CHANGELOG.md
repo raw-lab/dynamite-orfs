@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.1 — License fix to CC BY-NC 4.0
+Only fix license on crates
+
 ## 1.1.0 — Prodigal gap options + bug fixes
 
 Drafted as 1.0.2; the new gap options make it a minor release under semver. Source audited against

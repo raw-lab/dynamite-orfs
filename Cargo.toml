@@ -3,7 +3,9 @@ name = "dynamite-orfs"
 version = "1.1.1"
 edition = "2021"
 rust-version = "1.75"
-license = "GPL-3.0-or-later"
+# CC BY-NC 4.0 throughout: src/lib.rs refuses to compile under any other
+# licence value, and tests/license.rs checks README.md and LICENSE.txt.
+license = "CC-BY-NC-4.0"
 authors = ["Richard Allen White III <rwhit101@charlotte.edu>"]
 repository = "https://github.com/raw-lab/dynamite"
 homepage = "https://github.com/raw-lab/dynamite"

@@ -17,8 +17,8 @@
 ### an ORF / gene caller for **all domains of life**
 
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org/)
-![License](https://img.shields.io/badge/license-CC_BY--NC_4.0-blue)
-[![Version](https://img.shields.io/badge/version-1.1.0-success)](https://github.com/raw-lab/dynamite)
+[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](LICENSE.txt)
+[![Version](https://img.shields.io/badge/version-1.1.1-success)](https://github.com/raw-lab/dynamite)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey)](https://github.com/raw-lab/dynamite)
 [![Single binary](https://img.shields.io/badge/single%20binary-~8%20MB-brightgreen)](https://github.com/raw-lab/dynamite)
 
@@ -320,7 +320,7 @@ DYNAMITE is faithful **in spirit** to its namesakes; some engines are deliberate
   eukaryotic annotation use **AUGUSTUS**, **BRAKER**, or **Helixer**.
 - **`fraggenescan`** is **not** a simplification — DYNAMITE vendors the actual
   [FragGeneScanRs](https://github.com/unipept/FragGeneScanRs) core (`src/fgs/`,
-  GPL-3.0, unmodified algorithm) and runs its full forward/Viterbi HMM with the original embedded
+  GPL-3.0-or-later, unmodified algorithm) and runs its full forward/Viterbi HMM with the original embedded
   models. Output is identical to FragGeneScanRs run with `-t complete`. **That is FragGeneScan's
   error-free model** (insertion / deletion transitions of 1e-18), so sequencing-error frameshifts are
   *not* corrected — on λ reads with 0.5% insertions + 0.5% deletions, 0 of 4,580 genes were
@@ -335,8 +335,7 @@ DYNAMITE is faithful **in spirit** to its namesakes; some engines are deliberate
 - **`rna`** is **heuristic, not a covariance-model search.** The tRNA scanner requires a near-canonical
   cloverleaf (7-bp acceptor stem, 5/5 anticodon &amp; T-arm stems, conserved TΨC loop): high precision,
   modest sensitivity (0 false positives on phiX174 / λ; finds canonical tRNAs with the right anticodon).
-  rRNA detection just anchors on conserved SSU/LSU motifs. For annotation use **tRNAscan-SE** and
-  **barrnap** / **Infernal + Rfam**.
+  rRNA detection just anchors on conserved SSU/LSU motifs. For annotation use [**Merlin-RNA**](https://crates.io/crates/merlin-rna)
 
 </details>
 
@@ -397,6 +396,20 @@ DYNAMITE is faithful **in spirit** to its namesakes; some engines are deliberate
 
 ---
 
+## 📄 License
+
+DYNAMITE is licensed under **Creative Commons Attribution-NonCommercial 4.0 International
+(CC BY-NC 4.0)**: free for academic, research and other non-commercial use, with attribution.
+Commercial use needs prior written permission from the copyright holder. See
+[`LICENSE.txt`](LICENSE.txt) for the full legal code.
+
+Third-party code keeps its own licence: the vendored [FragGeneScanRs](https://github.com/unipept/FragGeneScanRs)
+core in `src/fgs/` (code and trained models) is GPL-3.0-or-later, by its authors. The `prodigal*`
+and `phanotate` engines re-implement [Prodigal](https://github.com/hyattpd/Prodigal) (GPL-3.0) and
+[PHANOTATE](https://github.com/deprekate/PHANOTATE) (GPL-3.0-or-later).
+
+---
+
 <div align="center">
-<sub><b>DYNAMITE</b> · RAW Lab · Richard Allen White III · GPL-3.0-or-later · github.com/raw-lab/dynamite</sub>
+<sub><b>DYNAMITE</b> · RAW Lab · Richard Allen White III · CC BY-NC 4.0 · github.com/raw-lab/dynamite</sub>
 </div>

@@ -1,7 +1,26 @@
 # Changelog
 
-## 1.1.1 — License fix to CC BY-NC 4.0
-Only fix license on crates
+## 1.1.1 — CC BY-NC 4.0 throughout
+
+- [x] **Licence: CC BY-NC 4.0 everywhere.** `Cargo.toml` said `license = "GPL-3.0-or-later"` in the
+  GitHub tree (crates.io 1.0.1 said `CC-BY-NC-4.0`), and the README carried a GPL badge and footer.
+  Now: `Cargo.toml` `license = "CC-BY-NC-4.0"`, a CC BY-NC 4.0 README badge (linking to
+  `LICENSE.txt`, which exists, unlike the old `LICENSE` link), a "📄 License" README section and footer,
+  and `dynamite::LICENSE`.
+- [x] **`LICENSE.txt` is now the CC BY-NC 4.0 legal code** (Creative Commons Attribution-NonCommercial
+  4.0 International, Sections 1–8), under the copyright line and a note that commercial use needs
+  prior written permission. The old file was a short custom text titled "CC BY-NC 4.0", which did not
+  match the `CC-BY-NC-4.0` identifier crates.io shows.
+- [x] **It cannot go back to GPL unnoticed.** `src/lib.rs` refuses to compile — so `cargo build`,
+  `cargo test` and `cargo publish` all stop — unless `Cargo.toml` declares exactly
+  `license = "CC-BY-NC-4.0"`, and `tests/license.rs` checks `Cargo.toml`, `LICENSE.txt` and the README
+  badge, footer and version.
+- [x] Bundled third-party code is named with its own licence (README "License", `src/fgs/mod.rs`):
+  FragGeneScanRs (`src/fgs/`, GPL-3.0-or-later); the Prodigal (GPL-3.0) and PHANOTATE
+  (GPL-3.0-or-later) re-implementations. The old `src/fgs/mod.rs` note calling FragGeneScanRs
+  "compatible with DYNAMITE's licence" is gone — it dated from when the crate was GPL.
+
+`cargo test`: 49 unit, 3 licence and 15 regression tests.
 
 ## 1.1.0 — Prodigal gap options + bug fixes
 
@@ -127,6 +146,22 @@ pyrodigal 3.7.1, pyrodigal-gv 0.3.2 and Biopython.
 - [x] README told users to `cargo install dynamite`, which installs an unrelated crate; the crate is
   `dynamite-orfs`.
 - [x] `cargo clippy` aborted on a deny-level lint (`almost_swapped`), hiding the MSRV lint.
+
+### Needs a decision before publishing (not changed)
+
+- [x] **Licence metadata is inconsistent.** GitHub `Cargo.toml` says `GPL-3.0-or-later` (and the README
+  shows a GPL badge/footer) while `LICENSE.txt` and crates.io 1.0.1 say CC BY-NC 4.0. *Decided:
+  CC BY-NC 4.0 throughout — done in 1.1.1.*
+- [ ] **Licence compatibility.** `src/fgs/` vendors GPL-3.0-or-later FragGeneScanRs code and models,
+  and the Prodigal / PHANOTATE engines are ports of GPL-3.0 code; GPL terms do not allow
+  redistribution under CC BY-NC. Options: permission from the authors, dropping or replacing the
+  vendored FragGeneScanRs core, or listing both licences (`CC-BY-NC-4.0 AND GPL-3.0-or-later`).
+- [ ] **FragGeneScan error models.** FragGeneScan's `illumina_1/5/10`, `454_5/10/30` and `sanger_5/10`
+  models are already embedded. Using one for `reads` / `long-reads` (FragGeneScan recommends
+  `illumina_5`/`_10` for Illumina, `454_*` for indel-rich reads) would turn on frameshift correction
+  (on the indel-λ reads: 1,925 of 3,654 genes corrected with `illumina_5`, 2,605 of 3,393 with
+  `454_10`), but it changes every read-mode result, and corrected genes need an output flag, because
+  their proteins no longer match a plain translation of their coordinates.
 
 ### Performance
 

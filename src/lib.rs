@@ -26,6 +26,34 @@
 
 pub mod augustus;
 pub mod banner;
+
+/// DYNAMITE's licence, as an SPDX identifier: Creative Commons
+/// Attribution-NonCommercial 4.0 International (CC BY-NC 4.0). See
+/// `LICENSE.txt`; bundled third-party code keeps its own licence (README,
+/// "License").
+pub const LICENSE: &str = "CC-BY-NC-4.0";
+
+const fn same_str(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// Licence guard: the crate does not compile (so it cannot be built, tested or
+// published) unless Cargo.toml declares exactly `license = "CC-BY-NC-4.0"`.
+const _: () = assert!(
+    same_str(env!("CARGO_PKG_LICENSE"), LICENSE),
+    "Cargo.toml must declare license = \"CC-BY-NC-4.0\": DYNAMITE is CC BY-NC 4.0 throughout"
+);
 pub mod codon;
 pub mod dedup;
 pub mod doctor;
